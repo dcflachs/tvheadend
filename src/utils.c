@@ -27,29 +27,7 @@
 #include <unistd.h>
 #include <ctype.h>
 #include "tvheadend.h"
-
-#if defined(PLATFORM_DARWIN)
-#include <machine/endian.h>
-#elif defined(PLATFORM_FREEBSD)
-#include <sys/endian.h>
-#else
-#include <endian.h>
-#endif
-
-#ifndef BYTE_ORDER
-#define BYTE_ORDER __BYTE_ORDER
-#endif
-#ifndef LITTLE_ENDIAN
-#define LITTLE_ENDIAN __LITTLE_ENDIAN
-#endif
-#ifndef BIG_ENDIAN
-#define BIG_ENDIAN __BIG_ENDIAN
-#endif
-#if BYTE_ORDER == LITTLE_ENDIAN
-#define ENDIAN_SWAP_COND(x) (!(x))
-#else
-#define ENDIAN_SWAP_COND(x) (x)
-#endif
+#include "tvh_endian.h"
 
 /**
  * CRC32 
@@ -355,20 +333,7 @@ sbuf_reset(sbuf_t *sb, int max_len)
 void
 sbuf_reset_and_alloc(sbuf_t *sb, int len)
 {
-  if (sb->sb_data) {
-    if (len != sb->sb_size) {
-      void *n = realloc(sb->sb_data, len);
-      if (n) {
-        sb->sb_data = n;
-        sb->sb_size = len;
-      }
-    }
-  } else {
-    sb->sb_data = malloc(len);
-    sb->sb_size = len;
-  }
-  if (sb->sb_data == NULL)
-    sbuf_alloc_fail(len);
+  sbuf_realloc(sb, len);
   sb->sb_ptr = sb->sb_err = 0;
 }
 
@@ -386,6 +351,25 @@ sbuf_alloc_(sbuf_t *sb, int len)
 
   if(sb->sb_data == NULL)
     sbuf_alloc_fail(sb->sb_size);
+}
+
+void
+sbuf_realloc(sbuf_t *sb, int len)
+{
+  if (sb->sb_data) {
+    if (len != sb->sb_size) {
+      void *n = realloc(sb->sb_data, len);
+      if (n) {
+        sb->sb_data = n;
+        sb->sb_size = len;
+      }
+    }
+  } else {
+    sb->sb_data = malloc(len);
+    sb->sb_size = len;
+  }
+  if (sb->sb_data == NULL)
+    sbuf_alloc_fail(len);
 }
 
 void
@@ -494,7 +478,7 @@ md5sum ( const char *str )
 }
 
 int
-makedirs ( const char *inpath, int mode )
+makedirs ( const char *inpath, int mode, gid_t gid, uid_t uid )
 {
   int err, ok;
   size_t x;
@@ -513,15 +497,20 @@ makedirs ( const char *inpath, int mode )
       path[x] = 0;
       if (stat(path, &st)) {
         err = mkdir(path, mode);
-        tvhtrace("settings", "Creating directory \"%s\" with octal permissions \"%o\"", path, mode);
+        if (!err && gid != -1 && uid != -1)
+          err = chown(path, uid, gid);
+        if (!err)
+          err = chmod(path, mode); /* override umode */
+        tvhtrace("settings", "Creating directory \"%s\" with octal permissions "
+                             "\"%o\" gid %d uid %d", path, mode, gid, uid);
       } else {
         err   = S_ISDIR(st.st_mode) ? 0 : 1;
         errno = ENOTDIR;
       }
       if (err) {
-	      tvhlog(LOG_ALERT, "settings", "Unable to create dir \"%s\": %s",
-	             path, strerror(errno));
-	      return -1;
+        tvhlog(LOG_ALERT, "settings", "Unable to create dir \"%s\": %s",
+               path, strerror(errno));
+        return -1;
       }
       path[x] = '/';
     }
@@ -615,3 +604,121 @@ char *url_encode(char *str) {
   return buf;
 }
 
+/*
+ *
+ */
+
+static inline uint32_t mpegts_word32( const uint8_t *tsb )
+{
+  //assert(((intptr_t)tsb & 3) == 0);
+  return *(uint32_t *)tsb;
+}
+
+int
+mpegts_word_count ( const uint8_t *tsb, int len, uint32_t mask )
+{
+  uint32_t val;
+  int r = 0;
+
+#if BYTE_ORDER == LITTLE_ENDIAN
+  mask = bswap_32(mask);
+#endif
+
+  val  = mpegts_word32(tsb) & mask;
+
+  while (len >= 188) {
+    if (len >= 4*188 &&
+        (mpegts_word32(tsb+0*188) & mask) == val &&
+        (mpegts_word32(tsb+1*188) & mask) == val &&
+        (mpegts_word32(tsb+2*188) & mask) == val &&
+        (mpegts_word32(tsb+3*188) & mask) == val) {
+      r   += 4*188;
+      len -= 4*188;
+      tsb += 4*188;
+    } else if ((mpegts_word32(tsb) & mask) == val) {
+      r   += 188;
+      len -= 188;
+      tsb += 188;
+    } else {
+      break;
+    }
+  }
+
+  return r;
+}
+
+static void
+deferred_unlink_cb(void *s, int dearmed)
+{
+  if (unlink((const char *)s))
+    tvherror("main", "unable to remove file '%s'", (const char *)s);
+  free(s);
+}
+
+typedef struct {
+  char *filename;
+  char *rootdir;
+} deferred_unlink_t;
+
+static void
+deferred_unlink_dir_cb(void *s, int dearmed)
+{
+  deferred_unlink_t *du = s;
+  char *p;
+  int l;
+
+  if (unlink((const char *)du->filename))
+    tvherror("main", "unable to remove file '%s'", (const char *)du->filename);
+
+  /* Remove all directories up to rootdir */
+
+  l = strlen(du->filename) - 1;
+  p = du->filename;
+
+  for(; l >= 0; l--) {
+    if(p[l] == '/') {
+      p[l] = 0;
+      if(strncmp(p, du->rootdir, l) == 0)
+        break;
+      if(rmdir(p) == -1)
+        break;
+    }
+  }
+
+  free(du->filename);
+  free(du->rootdir);
+  free(du);
+}
+
+int
+deferred_unlink(const char *filename, const char *rootdir)
+{
+  deferred_unlink_t *du;
+  char *s;
+  size_t l;
+  int r;
+
+  l = strlen(filename);
+  s = malloc(l + 9 + 1);
+  if (s == NULL)
+    return -ENOMEM;
+  strcpy(s, filename);
+  strcpy(s + l, ".removing");
+  r = rename(filename, s);
+  if (r) {
+    r = -errno;
+    free(s);
+    return r;
+  }
+  if (rootdir == NULL)
+    tasklet_arm_alloc(deferred_unlink_cb, s);
+  else {
+    du = calloc(1, sizeof(*du));
+    if (du == NULL)
+      return -ENOMEM;
+    du->filename = s;
+    du->rootdir = strdup(rootdir);
+    tasklet_arm_alloc(deferred_unlink_dir_cb, du);
+  }
+  return 0;
+}

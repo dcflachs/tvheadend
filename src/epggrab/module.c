@@ -68,7 +68,8 @@ htsmsg_t *epggrab_module_list ( void )
       htsmsg_add_str(e, "name", m->name);
     if(m->type == EPGGRAB_EXT) {
       epggrab_module_ext_t *ext = (epggrab_module_ext_t*)m;
-      htsmsg_add_str(e, "path", ext->path);
+      if (ext->path)
+        htsmsg_add_str(e, "path", ext->path);
     }
     htsmsg_add_msg(a, NULL, e);
   }
@@ -163,8 +164,10 @@ void epggrab_module_ch_save ( void *_m, epggrab_channel_t *ch )
     htsmsg_add_str(a, NULL, channel_get_uuid(ecl->ecl_channel));
   }
   if (a) htsmsg_add_msg(m, "channels", a);
-  if (ch->number)
-    htsmsg_add_u32(m, "number", ch->number);
+  if (ch->major)
+    htsmsg_add_u32(m, "major", ch->major);
+  if (ch->minor)
+    htsmsg_add_u32(m, "minor", ch->minor);
 
   hts_settings_save(m, "epggrab/%s/channels/%s", mod->id, ch->id);
   htsmsg_destroy(m);
@@ -208,8 +211,10 @@ static void _epggrab_module_channel_load
     egc->name = strdup(str);
   if ((str = htsmsg_get_str(m, "icon")))
     egc->icon = strdup(str);
-  if(!htsmsg_get_u32(m, "number", &u32))
-    egc->number = u32;
+  if(!htsmsg_get_u32(m, "major", &u32))
+    egc->major = u32;
+  if(!htsmsg_get_u32(m, "minor", &u32))
+    egc->minor = u32;
   if ((a = htsmsg_get_list(m, "channels"))) {
     HTSMSG_FOREACH(f, a) {
       if ((str = htsmsg_field_get_str(f))) {
@@ -296,6 +301,8 @@ char *epggrab_module_grab_spawn ( void *m )
 
   /* Grab */
   outlen = spawn_and_give_stdout(argv[0], (char **)argv, NULL, &rd, NULL, 1);
+
+  spawn_free_args(argv);
 
   if (outlen < 0)
     goto error;

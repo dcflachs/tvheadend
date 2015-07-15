@@ -1,6 +1,6 @@
 /*
  *  tvheadend, Automatic recordings
- *  Copyright (C) 2010 Andreas Öman
+ *  Copyright (C) 2010 Andreas Ã–man
  *
  *  This program is free software: you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -88,27 +88,46 @@ autorec_cmp(dvr_autorec_entry_t *dae, epg_broadcast_t *e)
   //       if configured
   if(dae->dae_serieslink) {
     if (!e->serieslink || dae->dae_serieslink != e->serieslink) return 0;
-    return 1;
+  } else {
+    if(dae->dae_season)
+      if (!e->episode->season || dae->dae_season != e->episode->season) return 0;
+    if(dae->dae_brand)
+      if (!e->episode->brand || dae->dae_brand != e->episode->brand) return 0;
   }
-  if(dae->dae_season)
-    if (!e->episode->season || dae->dae_season != e->episode->season) return 0;
-  if(dae->dae_brand)
-    if (!e->episode->brand || dae->dae_brand != e->episode->brand) return 0;
   if(dae->dae_title != NULL && dae->dae_title[0] != '\0') {
     lang_str_ele_t *ls;
-    if(!e->episode->title) return 0;
-    RB_FOREACH(ls, e->episode->title, link)
-      if (!regexec(&dae->dae_title_preg, ls->str, 0, NULL, 0)) break;
+    if (!dae->dae_fulltext) {
+      if(!e->episode->title) return 0;
+      RB_FOREACH(ls, e->episode->title, link)
+        if (!regexec(&dae->dae_title_preg, ls->str, 0, NULL, 0)) break;
+    } else {
+      ls = NULL;
+      if (e->episode->title)
+        RB_FOREACH(ls, e->episode->title, link)
+          if (!regexec(&dae->dae_title_preg, ls->str, 0, NULL, 0)) break;
+      if (!ls && e->episode->subtitle)
+        RB_FOREACH(ls, e->episode->subtitle, link)
+          if (!regexec(&dae->dae_title_preg, ls->str, 0, NULL, 0)) break;
+      if (!ls && e->summary)
+        RB_FOREACH(ls, e->summary, link)
+          if (!regexec(&dae->dae_title_preg, ls->str, 0, NULL, 0)) break;
+      if (!ls && e->description)
+        RB_FOREACH(ls, e->description, link)
+          if (!regexec(&dae->dae_title_preg, ls->str, 0, NULL, 0)) break;
+    }
     if (!ls) return 0;
   }
 
   // Note: ignore channel test if we allow quality unlocking 
   if ((cfg = dae->dae_config) == NULL)
     return 0;
-  if (cfg->dvr_sl_quality_lock)
-    if(dae->dae_channel != NULL &&
-       dae->dae_channel != e->channel)
+  if(dae->dae_channel != NULL) {
+    if (dae->dae_channel != e->channel &&
+        dae->dae_channel->ch_enabled)
       return 0;
+    if (!dae->dae_channel->ch_enabled)
+      return 0;
+  }
 
   if(dae->dae_channel_tag != NULL) {
     LIST_FOREACH(ctm, &dae->dae_channel_tag->ct_ctms, ctm_tag_link)
@@ -205,11 +224,11 @@ dvr_autorec_create(const char *uuid, htsmsg_t *conf)
 
 
 dvr_autorec_entry_t*
-dvr_autorec_create_htsp(const char *dvr_config_name, const char *title,
+dvr_autorec_create_htsp(const char *dvr_config_name, const char *title, int fulltext,
                             channel_t *ch, uint32_t enabled, int32_t start, int32_t start_window,
                             uint32_t weekdays, time_t start_extra, time_t stop_extra,
                             dvr_prio_t pri, int retention,
-                            int min_duration, int max_duration,
+                            int min_duration, int max_duration, dvr_autorec_dedup_t dup_detect,
                             const char *owner, const char *creator, const char *comment, 
                             const char *name, const char *directory)
 {
@@ -227,6 +246,8 @@ dvr_autorec_create_htsp(const char *dvr_config_name, const char *title,
   htsmsg_add_s64(conf, "start_extra", start_extra);
   htsmsg_add_s64(conf, "stop_extra",  stop_extra);
   htsmsg_add_str(conf, "title",       title);
+  htsmsg_add_u32(conf, "fulltext",    fulltext);
+  htsmsg_add_u32(conf, "record",      dup_detect);
   htsmsg_add_str(conf, "config_name", dvr_config_name ?: "");
   htsmsg_add_str(conf, "owner",       owner ?: "");
   htsmsg_add_str(conf, "creator",     creator ?: "");
@@ -367,6 +388,20 @@ static void
 dvr_autorec_entry_class_delete(idnode_t *self)
 {
   autorec_entry_destroy((dvr_autorec_entry_t *)self, 1);
+}
+
+static int
+dvr_autorec_entry_class_perm(idnode_t *self, access_t *a, htsmsg_t *msg_to_write)
+{
+  dvr_autorec_entry_t *dae = (dvr_autorec_entry_t *)self;
+
+  if (access_verify2(a, ACCESS_OR|ACCESS_ADMIN|ACCESS_RECORDER))
+    return -1;
+  if (!access_verify2(a, ACCESS_ADMIN))
+    return 0;
+  if (dvr_autorec_entry_verify(dae, a, msg_to_write == NULL ? 1 : 0))
+    return -1;
+  return 0;
 }
 
 static const char *
@@ -832,6 +867,20 @@ dvr_autorec_entry_class_content_type_list(void *o)
   return m;
 }
 
+static htsmsg_t *
+dvr_autorec_entry_class_dedup_list ( void *o )
+{
+  static const struct strtab tab[] = {
+    { "Record all",            DVR_AUTOREC_RECORD_ALL },
+    { "Record if different episode number", DVR_AUTOREC_RECORD_DIFFERENT_EPISODE_NUMBER },
+    { "Record if different subtitle", DVR_AUTOREC_RECORD_DIFFERENT_SUBTITLE },
+    { "Record if different description", DVR_AUTOREC_RECORD_DIFFERENT_DESCRIPTION },
+    { "Record once per week", DVR_AUTOREC_RECORD_ONCE_PER_WEEK },
+    { "Record once per day", DVR_AUTOREC_RECORD_ONCE_PER_DAY },
+  };
+  return strtab2htsmsg(tab);
+}
+
 const idclass_t dvr_autorec_entry_class = {
   .ic_class      = "dvrautorec",
   .ic_caption    = "DVR Auto-Record Entry",
@@ -839,6 +888,7 @@ const idclass_t dvr_autorec_entry_class = {
   .ic_save       = dvr_autorec_entry_class_save,
   .ic_get_title  = dvr_autorec_entry_class_get_title,
   .ic_delete     = dvr_autorec_entry_class_delete,
+  .ic_perm       = dvr_autorec_entry_class_perm,
   .ic_properties = (const property_t[]) {
     {
       .type     = PT_BOOL,
@@ -864,6 +914,12 @@ const idclass_t dvr_autorec_entry_class = {
       .name     = "Title (Regexp)",
       .set      = dvr_autorec_entry_class_title_set,
       .off      = offsetof(dvr_autorec_entry_t, dae_title),
+    },
+    {
+      .type     = PT_BOOL,
+      .id       = "fulltext",
+      .name     = "Fulltext",
+      .off      = offsetof(dvr_autorec_entry_t, dae_fulltext),
     },
     {
       .type     = PT_STR,
@@ -956,6 +1012,14 @@ const idclass_t dvr_autorec_entry_class = {
       .list     = dvr_entry_class_pri_list,
       .def.i    = DVR_PRIO_NORMAL,
       .off      = offsetof(dvr_autorec_entry_t, dae_pri),
+    },
+    {
+      .type     = PT_U32,
+      .id       = "record",
+      .name     = "Duplicate Handling",
+      .def.i    = DVR_AUTOREC_RECORD_ALL,
+      .off      = offsetof(dvr_autorec_entry_t, dae_record),
+      .list     = dvr_autorec_entry_class_dedup_list,
     },
     {
       .type     = PT_INT,
@@ -1142,7 +1206,7 @@ autorec_destroy_by_channel_tag(channel_tag_t *ct, int delconf)
   while((dae = LIST_FIRST(&ct->ct_autorecs)) != NULL) {
     LIST_REMOVE(dae, dae_channel_tag_link);
     dae->dae_channel_tag = NULL;
-    idnode_notify_simple(&dae->dae_id);
+    idnode_notify_changed(&dae->dae_id);
     if (delconf)
       dvr_autorec_save(dae);
   }
@@ -1180,4 +1244,54 @@ autorec_destroy_by_config(dvr_config_t *kcfg, int delconf)
     if (delconf)
       dvr_autorec_save(dae);
   }
+}
+
+static inline int extra_valid(time_t extra)
+{
+  return extra != 0 && extra != (time_t)-1;
+}
+
+/**
+ *
+ */
+int
+dvr_autorec_get_extra_time_pre( dvr_autorec_entry_t *dae )
+{
+  time_t extra = dae->dae_start_extra;
+
+  if (!extra_valid(extra)) {
+    if (dae->dae_channel)
+      extra = dae->dae_channel->ch_dvr_extra_time_pre;
+    if (!extra_valid(extra))
+      extra = dae->dae_config->dvr_extra_time_pre;
+  }
+  return extra;
+}
+
+/**
+ *
+ */
+int
+dvr_autorec_get_extra_time_post( dvr_autorec_entry_t *dae )
+{
+  time_t extra = dae->dae_stop_extra;
+
+  if (!extra_valid(extra)) {
+    if (dae->dae_channel)
+      extra = dae->dae_channel->ch_dvr_extra_time_post;
+    if (!extra_valid(extra))
+      extra = dae->dae_config->dvr_extra_time_post;
+  }
+  return extra;
+}
+
+/**
+ *
+ */
+int
+dvr_autorec_get_retention( dvr_autorec_entry_t *dae )
+{
+  if (dae->dae_retention > 0)
+    return dae->dae_retention;
+  return dae->dae_config->dvr_retention_days;
 }

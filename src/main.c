@@ -1,6 +1,6 @@
 /*
  *  TVheadend
- *  Copyright (C) 2007 - 2010 Andreas �man
+ *  Copyright (C) 2007 - 2010 Andreas Öman
  *
  *  This program is free software: you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -50,6 +50,7 @@
 #include "descrambler.h"
 #include "dvr/dvr.h"
 #include "htsp_server.h"
+#include "satip/server.h"
 #include "avahi.h"
 #include "bonjour.h"
 #include "input.h"
@@ -57,6 +58,7 @@
 #include "trap.h"
 #include "settings.h"
 #include "config.h"
+#include "notify.h"
 #include "idnode.h"
 #include "imagecache.h"
 #include "timeshift.h"
@@ -70,6 +72,7 @@
 #endif
 #include "profile.h"
 #include "bouquet.h"
+#include "tvhtime.h"
 
 #ifdef PLATFORM_LINUX
 #include <sys/prctl.h>
@@ -139,8 +142,14 @@ const tvh_caps_t tvheadend_capabilities[] = {
 #if ENABLE_CWC || ENABLE_CAPMT || ENABLE_CONSTCW
   { "caclient", NULL },
 #endif
-#if ENABLE_V4L || ENABLE_LINUXDVB || ENABLE_SATIP_CLIENT || ENABLE_HDHOMERUN_CLIENT
+#if ENABLE_LINUXDVB || ENABLE_SATIP_CLIENT || ENABLE_HDHOMERUN_CLIENT
   { "tvadapters", NULL },
+#endif
+#if ENABLE_SATIP_CLIENT
+  { "satip_client", NULL },
+#endif
+#if ENABLE_SATIP_SERVER
+  { "satip_server", NULL },
 #endif
 #if ENABLE_IMAGECACHE
   { "imagecache", (uint32_t*)&imagecache_conf.enabled },
@@ -155,7 +164,7 @@ const tvh_caps_t tvheadend_capabilities[] = {
 };
 
 pthread_mutex_t global_lock;
-pthread_mutex_t ffmpeg_lock;
+pthread_mutex_t tasklet_lock;
 pthread_mutex_t fork_lock;
 pthread_mutex_t atomic_lock;
 
@@ -164,6 +173,9 @@ pthread_mutex_t atomic_lock;
  */
 static LIST_HEAD(, gtimer) gtimers;
 static pthread_cond_t gtimer_cond;
+static TAILQ_HEAD(, tasklet) tasklets;
+static pthread_cond_t tasklet_cond;
+static pthread_t tasklet_tid;
 
 static void
 handle_sigpipe(int x)
@@ -230,8 +242,8 @@ gtimercmp(gtimer_t *a, gtimer_t *b)
  *
  */
 void
-gtimer_arm_abs2
-  (gtimer_t *gti, gti_callback_t *callback, void *opaque, struct timespec *when)
+GTIMER_FCN(gtimer_arm_abs2)
+  (GTIMER_TRACEID_ gtimer_t *gti, gti_callback_t *callback, void *opaque, struct timespec *when)
 {
   lock_assert(&global_lock);
 
@@ -241,10 +253,12 @@ gtimer_arm_abs2
   gti->gti_callback = callback;
   gti->gti_opaque   = opaque;
   gti->gti_expire   = *when;
+#if ENABLE_GTIMER_CHECK
+  gti->gti_id       = id;
+  gti->gti_fcn      = fcn;
+#endif
 
   LIST_INSERT_SORTED(&gtimers, gti, gti_link, gtimercmp);
-
-  //tvhdebug("gtimer", "%p @ %ld.%09ld", gti, when->tv_sec, when->tv_nsec);
 
   if (LIST_FIRST(&gtimers) == gti)
     pthread_cond_signal(&gtimer_cond); // force timer re-check
@@ -254,37 +268,50 @@ gtimer_arm_abs2
  *
  */
 void
-gtimer_arm_abs
-  (gtimer_t *gti, gti_callback_t *callback, void *opaque, time_t when)
+GTIMER_FCN(gtimer_arm_abs)
+  (GTIMER_TRACEID_ gtimer_t *gti, gti_callback_t *callback, void *opaque, time_t when)
 {
   struct timespec ts;
   ts.tv_nsec = 0;
   ts.tv_sec  = when;
+#if ENABLE_GTIMER_CHECK
+  GTIMER_FCN(gtimer_arm_abs2)(id, fcn, gti, callback, opaque, &ts);
+#else
   gtimer_arm_abs2(gti, callback, opaque, &ts);
+#endif
 }
 
 /**
  *
  */
 void
-gtimer_arm(gtimer_t *gti, gti_callback_t *callback, void *opaque, int delta)
+GTIMER_FCN(gtimer_arm)
+  (GTIMER_TRACEID_ gtimer_t *gti, gti_callback_t *callback, void *opaque, int delta)
 {
+#if ENABLE_GTIMER_CHECK
+  GTIMER_FCN(gtimer_arm_abs)(id, fcn, gti, callback, opaque, dispatch_clock + delta);
+#else
   gtimer_arm_abs(gti, callback, opaque, dispatch_clock + delta);
+#endif
 }
 
 /**
  *
  */
 void
-gtimer_arm_ms
-  (gtimer_t *gti, gti_callback_t *callback, void *opaque, long delta_ms )
+GTIMER_FCN(gtimer_arm_ms)
+  (GTIMER_TRACEID_ gtimer_t *gti, gti_callback_t *callback, void *opaque, long delta_ms )
 {
   struct timespec ts;
   clock_gettime(CLOCK_REALTIME, &ts);
   ts.tv_nsec += (1000000 * delta_ms);
   ts.tv_sec  += (ts.tv_nsec / 1000000000);
   ts.tv_nsec %= 1000000000;
+#if ENABLE_GTIMER_CHECK
+  GTIMER_FCN(gtimer_arm_abs2)(id, fcn, gti, callback, opaque, &ts);
+#else
   gtimer_arm_abs2(gti, callback, opaque, &ts);
+#endif
 }
 
 /**
@@ -294,10 +321,106 @@ void
 gtimer_disarm(gtimer_t *gti)
 {
   if(gti->gti_callback) {
-    //tvhdebug("gtimer", "%p disarm", gti);
     LIST_REMOVE(gti, gti_link);
     gti->gti_callback = NULL;
   }
+}
+
+/**
+ *
+ */
+tasklet_t *
+tasklet_arm_alloc(tsk_callback_t *callback, void *opaque)
+{
+  tasklet_t *tsk = calloc(1, sizeof(*tsk));
+  if (tsk) {
+    tsk->tsk_allocated = 1;
+    tasklet_arm(tsk, callback, opaque);
+  }
+  return tsk;
+}
+
+/**
+ *
+ */
+void
+tasklet_arm(tasklet_t *tsk, tsk_callback_t *callback, void *opaque)
+{
+  pthread_mutex_lock(&tasklet_lock);
+
+  if (tsk->tsk_callback != NULL)
+    TAILQ_REMOVE(&tasklets, tsk, tsk_link);
+
+  tsk->tsk_callback = callback;
+  tsk->tsk_opaque   = opaque;
+
+  TAILQ_INSERT_TAIL(&tasklets, tsk, tsk_link);
+
+  if (TAILQ_FIRST(&tasklets) == tsk)
+    pthread_cond_signal(&tasklet_cond);
+
+  pthread_mutex_unlock(&tasklet_lock);
+}
+
+/**
+ *
+ */
+void
+tasklet_disarm(tasklet_t *tsk)
+{
+  pthread_mutex_lock(&tasklet_lock);
+
+  if(tsk->tsk_callback) {
+    TAILQ_REMOVE(&tasklets, tsk, tsk_link);
+    tsk->tsk_callback(tsk->tsk_opaque, 1);
+    tsk->tsk_callback = NULL;
+    if (tsk->tsk_allocated)
+      free(tsk);
+  }
+
+  pthread_mutex_unlock(&tasklet_lock);
+}
+
+static void
+tasklet_flush()
+{
+  tasklet_t *tsk;
+
+  pthread_mutex_lock(&tasklet_lock);
+
+  while ((tsk = TAILQ_FIRST(&tasklets)) != NULL) {
+    TAILQ_REMOVE(&tasklets, tsk, tsk_link);
+    tsk->tsk_callback(tsk->tsk_opaque, 1);
+    tsk->tsk_callback = NULL;
+    if (tsk->tsk_allocated)
+      free(tsk);
+  }
+
+  pthread_mutex_unlock(&tasklet_lock);
+}
+
+/**
+ *
+ */
+static void *
+tasklet_thread ( void *aux )
+{
+  tasklet_t *tsk;
+
+  pthread_mutex_lock(&tasklet_lock);
+  while (tvheadend_running) {
+    tsk = TAILQ_FIRST(&tasklets);
+    if (tsk == NULL) {
+      pthread_cond_wait(&tasklet_cond, &tasklet_lock);
+      continue;
+    }
+    if (tsk->tsk_callback)
+      tsk->tsk_callback(tsk->tsk_opaque, 0);
+    TAILQ_REMOVE(&tasklets, tsk, tsk_link);
+  }
+  pthread_mutex_unlock(&tasklet_lock);
+
+  return NULL;
 }
 
 /**
@@ -368,6 +491,11 @@ mainloop(void)
   gtimer_t *gti;
   gti_callback_t *cb;
   struct timespec ts;
+#if ENABLE_GTIMER_CHECK
+  int64_t mtm;
+  const char *id;
+  const char *fcn;
+#endif
 
   while(tvheadend_running) {
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -401,13 +529,21 @@ mainloop(void)
         break;
       }
 
+#if ENABLE_GTIMER_CHECK
+      mtm = getmonoclock();
+      id = gti->gti_id;
+      fcn = gti->gti_fcn;
+#endif
       cb = gti->gti_callback;
-      //tvhdebug("gtimer", "%p callback", gti);
 
       LIST_REMOVE(gti, gti_link);
       gti->gti_callback = NULL;
 
       cb(gti->gti_opaque);
+
+#if ENABLE_GTIMER_CHECK
+      tvhtrace("gtimer", "%s:%s duration %"PRId64"ns", id, fcn, getmonoclock() - mtm);
+#endif
     }
 
     /* Bound wait */
@@ -417,7 +553,6 @@ mainloop(void)
     }
 
     /* Wait */
-    //tvhdebug("gtimer", "wait till %ld.%09ld", ts.tv_sec, ts.tv_nsec);
     pthread_cond_timedwait(&gtimer_cond, &global_lock, &ts);
     pthread_mutex_unlock(&global_lock);
   }
@@ -438,6 +573,8 @@ main(int argc, char **argv)
   int  log_level   = LOG_INFO;
   int  log_options = TVHLOG_OPT_MILLIS | TVHLOG_OPT_STDERR | TVHLOG_OPT_SYSLOG;
   const char *log_debug = NULL, *log_trace = NULL;
+  gid_t gid = -1;
+  uid_t uid = -1;
   char buf[512];
   FILE *pidfile = NULL;
   extern int dvb_bouquets_parse;
@@ -445,17 +582,20 @@ main(int argc, char **argv)
   main_tid = pthread_self();
 
   /* Setup global mutexes */
-  pthread_mutex_init(&ffmpeg_lock, NULL);
   pthread_mutex_init(&fork_lock, NULL);
   pthread_mutex_init(&global_lock, NULL);
+  pthread_mutex_init(&tasklet_lock, NULL);
   pthread_mutex_init(&atomic_lock, NULL);
   pthread_cond_init(&gtimer_cond, NULL);
+  pthread_cond_init(&tasklet_cond, NULL);
+  TAILQ_INIT(&tasklets);
 
   /* Defaults */
   tvheadend_webui_port      = 9981;
   tvheadend_webroot         = NULL;
   tvheadend_htsp_port       = 9982;
   tvheadend_htsp_port_extra = 0;
+  time(&dispatch_clock);
 
   /* Command line options */
   int         opt_help         = 0,
@@ -464,12 +604,14 @@ main(int argc, char **argv)
               opt_firstrun     = 0,
               opt_stderr       = 0,
               opt_syslog       = 0,
+              opt_nosyslog     = 0,
               opt_uidebug      = 0,
               opt_abort        = 0,
               opt_noacl        = 0,
               opt_fileline     = 0,
               opt_threadid     = 0,
               opt_ipv6         = 0,
+              opt_satip_rtsp   = 0,
 #if ENABLE_TSFILE
               opt_tsfile_tuner = 0,
 #endif
@@ -522,6 +664,11 @@ main(int argc, char **argv)
     { 'a', "adapters",  "Only use specified DVB adapters (comma separated)",
       OPT_STR, &opt_dvb_adapters },
 #endif
+#if ENABLE_SATIP_SERVER
+    {   0, "satip_rtsp", "SAT>IP RTSP port number for server\n"
+                         "(default: -1 = disable, 0 = webconfig, standard port is 554)",
+      OPT_INT, &opt_satip_rtsp },
+#endif
 #if ENABLE_SATIP_CLIENT
     {   0, "satip_xml", "URL with the SAT>IP server XML location",
       OPT_STR_LIST, &opt_satip_xml },
@@ -545,6 +692,7 @@ main(int argc, char **argv)
     {   0, NULL,        "Debug Options",           OPT_BOOL, NULL         },
     { 'd', "stderr",    "Enable debug on stderr",  OPT_BOOL, &opt_stderr  },
     { 's', "syslog",    "Enable debug to syslog",  OPT_BOOL, &opt_syslog  },
+    { 'S', "nosyslog",  "Disable syslog (all msgs)", OPT_BOOL, &opt_nosyslog },
     { 'l', "logfile",   "Enable debug to file",    OPT_STR,  &opt_logpath },
     {   0, "debug",     "Enable debug subsystems", OPT_STR,  &opt_log_debug },
 #if ENABLE_TRACE
@@ -677,6 +825,8 @@ main(int argc, char **argv)
     if (opt_logpath)
       log_options   |= TVHLOG_OPT_DBG_FILE;
   }
+  if (opt_nosyslog)
+    log_options &= ~(TVHLOG_OPT_SYSLOG|TVHLOG_OPT_DBG_SYSLOG);
   if (opt_fileline)
     log_options |= TVHLOG_OPT_FILELINE;
   if (opt_threadid)
@@ -696,18 +846,9 @@ main(int argc, char **argv)
   signal(SIGPIPE, handle_sigpipe); // will be redundant later
   signal(SIGILL, handle_sigill);   // see handler..
 
-  tcp_server_preinit(opt_ipv6);
-  http_server_init(opt_bindaddr);  // bind to ports only
-  htsp_init(opt_bindaddr);	   // bind to ports only
-
-  if (opt_fork)
-    pidfile = tvh_fopen(opt_pidpath, "w+");
-
   /* Set priviledges */
   if(opt_fork || opt_group || opt_user) {
     const char *homedir;
-    gid_t gid;
-    uid_t uid;
     struct group  *grp = getgrnam(opt_group ?: "video");
     struct passwd *pw  = opt_user ? getpwnam(opt_user) : NULL;
 
@@ -739,16 +880,27 @@ main(int argc, char **argv)
     } else {
       uid = 1;
     }
-    if ((getgid() != gid) && setgid(gid)) {
-      tvhlog(LOG_ALERT, "START",
-             "setgid(%d) failed, do you have permission?", gid);
-      return 1;
-    }
-    if ((getuid() != uid) && setuid(uid)) {
-      tvhlog(LOG_ALERT, "START",
-             "setuid(%d) failed, do you have permission?", uid);
-      return 1;
-    }
+  }
+
+  uuid_init();
+  config_boot(opt_config, gid, uid);
+  tcp_server_preinit(opt_ipv6);
+  http_server_init(opt_bindaddr);    // bind to ports only
+  htsp_init(opt_bindaddr);	     // bind to ports only
+  satip_server_init(opt_satip_rtsp); // bind to ports only
+
+  if (opt_fork)
+    pidfile = tvh_fopen(opt_pidpath, "w+");
+
+  if (gid != -1 && (getgid() != gid) && setgid(gid)) {
+    tvhlog(LOG_ALERT, "START",
+           "setgid(%d) failed, do you have permission?", gid);
+    return 1;
+  }
+  if (uid != -1 && (getuid() != uid) && setuid(uid)) {
+    tvhlog(LOG_ALERT, "START",
+           "setuid(%d) failed, do you have permission?", uid);
+    return 1;
   }
 
   /* Daemonise */
@@ -799,16 +951,20 @@ main(int argc, char **argv)
   OPENSSL_config(NULL);
   SSL_load_error_strings();
   SSL_library_init();
-  
+
   /* Initialise configuration */
-  uuid_init();
+  notify_init();
   idnode_init();
   spawn_init();
-  config_init(opt_config, opt_nobackup == 0);
+  config_init(opt_nobackup == 0);
 
   /**
    * Initialize subsystems
    */
+
+  epg_in_load = 1;
+
+  tvhthread_create(&tasklet_tid, NULL, tasklet_thread, NULL);
 
   dbus_server_init(opt_dbus, opt_dbus_session);
 
@@ -821,6 +977,8 @@ main(int argc, char **argv)
 #if ENABLE_LIBAV
   libav_init();
 #endif
+
+  tvhtime_init();
 
   profile_init();
 
@@ -854,7 +1012,6 @@ main(int argc, char **argv)
 #endif
 
   tcp_server_init();
-  http_server_register();
   webui_init(opt_xspf);
 #if ENABLE_UPNP
   upnp_server_init(opt_bindaddr);
@@ -871,8 +1028,9 @@ main(int argc, char **argv)
 
   dbus_server_start();
 
+  http_server_register();
+  satip_server_register();
   htsp_register();
-
 
   if(opt_subscribe != NULL)
     subscription_dummy_join(opt_subscribe, 1);
@@ -881,6 +1039,7 @@ main(int argc, char **argv)
   bonjour_init();
 
   epg_updated(); // cleanup now all prev ref's should have been created
+  epg_in_load = 0;
 
   pthread_mutex_unlock(&global_lock);
 
@@ -914,14 +1073,13 @@ main(int argc, char **argv)
 #if ENABLE_UPNP
   tvhftrace("main", upnp_server_done);
 #endif
+  tvhftrace("main", satip_server_done);
   tvhftrace("main", htsp_done);
   tvhftrace("main", http_server_done);
   tvhftrace("main", webui_done);
   tvhftrace("main", fsmonitor_done);
-#if ENABLE_MPEGTS
-  tvhftrace("main", mpegts_done);
-#endif
   tvhftrace("main", http_client_done);
+  tvhftrace("main", tcp_server_done);
 
   // Note: the locking is obviously a bit redundant, but without
   //       we need to disable the gtimer_arm call in epg_save()
@@ -934,7 +1092,9 @@ main(int argc, char **argv)
   pthread_mutex_unlock(&global_lock);
 
   tvhftrace("main", epggrab_done);
-  tvhftrace("main", tcp_server_done);
+#if ENABLE_MPEGTS
+  tvhftrace("main", mpegts_done);
+#endif
   tvhftrace("main", descrambler_done);
   tvhftrace("main", service_mapper_done);
   tvhftrace("main", service_done);
@@ -949,6 +1109,14 @@ main(int argc, char **argv)
   tvhftrace("main", imagecache_done);
   tvhftrace("main", lang_code_done);
   tvhftrace("main", api_done);
+
+  tvhtrace("main", "tasklet enter");
+  pthread_cond_signal(&tasklet_cond);
+  pthread_join(tasklet_tid, NULL);
+  tvhtrace("main", "tasklet thread end");
+  tasklet_flush();
+  tvhtrace("main", "tasklet leave");
+
   tvhftrace("main", hts_settings_done);
   tvhftrace("main", dvb_done);
   tvhftrace("main", lang_str_done);
@@ -957,6 +1125,7 @@ main(int argc, char **argv)
   tvhftrace("main", intlconv_done);
   tvhftrace("main", urlparse_done);
   tvhftrace("main", idnode_done);
+  tvhftrace("main", notify_done);
   tvhftrace("main", spawn_done);
 
   tvhlog(LOG_NOTICE, "STOP", "Exiting HTS Tvheadend");

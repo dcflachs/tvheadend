@@ -53,6 +53,8 @@ struct satip_device_info
   char *serialnum;
   char *presentation;
   char *tunercfg;     /*< XML urn:ses-com:satipX_SATIPCAP contents */
+  int rtsp_port;
+  int srcs;
 };
 
 struct satip_device
@@ -60,6 +62,8 @@ struct satip_device
   tvh_hardware_t;
 
   gtimer_t                   sd_destroy_timer;
+  int                        sd_inload;
+  int                        sd_nosave;
 
   /*
    * Adapter info
@@ -81,22 +85,20 @@ struct satip_device
   int                        sd_pids_deladd;
   int                        sd_sig_scale;
   int                        sd_pids0;
+  char                      *sd_tunercfg;
+  int                        sd_pids21;
   int                        sd_pilot_on;
-  int                        sd_shutdown2;
+  int                        sd_no_univ_lnb;
   int                        sd_dbus_allow;
+  int                        sd_disable_workarounds;
   pthread_mutex_t            sd_tune_mutex;
 };
 
 struct satip_tune_req {
   mpegts_mux_instance_t     *sf_mmi;
 
-  uint16_t                  *sf_pids;
-  uint16_t                  *sf_pids_tuned;
-  int                        sf_pids_any;
-  int                        sf_pids_any_tuned;
-  int                        sf_pids_size;
-  int                        sf_pids_count;
-  int                        sf_pids_tcount;     /*< tuned count */
+  mpegts_apids_t             sf_pids;
+  mpegts_apids_t             sf_pids_tuned;
 };
 
 struct satip_frontend
@@ -114,13 +116,14 @@ struct satip_frontend
    */
   int                        sf_number;
   dvb_fe_type_t              sf_type;
-  int                        sf_type_t2;
+  int                        sf_type_v2;
   char                      *sf_type_override;
   int                        sf_master;
   int                        sf_udp_rtp_port;
   int                        sf_play2;
   int                        sf_tdelay;
   int                        sf_teardown_delay;
+  char                      *sf_tuner_bindaddr;
 
   /*
    * Reception
@@ -131,6 +134,7 @@ struct satip_frontend
   int                        sf_thread;
   int                        sf_running;
   int                        sf_tables;
+  int                        sf_atsc_c;
   int                        sf_position;
   signal_state_t             sf_status;
   gtimer_t                   sf_monitor_timer;
@@ -161,6 +165,7 @@ struct satip_satconf
   int                        sfc_enabled;
   int                        sfc_position;
   int                        sfc_priority;
+  int                        sfc_grace;
   char                      *sfc_name;
 
   /*
@@ -183,9 +188,11 @@ void satip_device_destroy ( satip_device_t *sd );
 
 void satip_device_destroy_later( satip_device_t *sd, int after_ms );
 
+char *satip_device_nicename ( satip_device_t *sd, char *buf, int len );
+
 satip_frontend_t *
 satip_frontend_create
-  ( htsmsg_t *conf, satip_device_t *sd, dvb_fe_type_t type, int t2, int num );
+  ( htsmsg_t *conf, satip_device_t *sd, dvb_fe_type_t type, int v2, int num );
 
 void satip_frontend_save ( satip_frontend_t *lfe, htsmsg_t *m );
 
@@ -207,6 +214,9 @@ void satip_satconf_updated_positions
 int satip_satconf_get_priority
   ( satip_frontend_t *lfe, mpegts_mux_t *mm );
 
+int satip_satconf_get_grace
+  ( satip_frontend_t *lfe, mpegts_mux_t *mm );
+
 int satip_satconf_get_position
   ( satip_frontend_t *lfe, mpegts_mux_t *mm );
 
@@ -217,6 +227,7 @@ int satip_satconf_get_position
 #define SATIP_SETUP_PLAY     (1<<0)
 #define SATIP_SETUP_PIDS0    (1<<1)
 #define SATIP_SETUP_PILOT_ON (1<<2)
+#define SATIP_SETUP_PIDS21   (1<<3)
 
 int
 satip_rtsp_setup( http_client_t *hc,

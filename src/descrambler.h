@@ -79,7 +79,7 @@ typedef struct th_descrambler_runtime {
 } th_descrambler_runtime_t;
 
 typedef void (*descrambler_section_callback_t)
-  (void *opaque, int pid, const uint8_t *section, int section_len);
+  (void *opaque, int pid, const uint8_t *section, int section_len, int emm);
 
 /**
  * Track required PIDs
@@ -167,7 +167,7 @@ void descrambler_keys          ( th_descrambler_t *t, int type,
                                  const uint8_t *even, const uint8_t *odd );
 int  descrambler_descramble    ( struct service *t,
                                  struct elementary_stream *st,
-                                 const uint8_t *tsb );
+                                 const uint8_t *tsb, int len );
 int  descrambler_open_pid      ( struct mpegts_mux *mux, void *opaque, int pid,
                                  descrambler_section_callback_t callback,
                                  struct service *service );

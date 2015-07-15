@@ -160,8 +160,8 @@ void         *idnode_find    (const char *uuid, const idclass_t *idc, const idno
 idnode_set_t *idnode_find_all(const idclass_t *idc, const idnodes_rb_t *nodes);
 
 
-void idnode_notify (idnode_t *in, int event);
-void idnode_notify_simple (void *in);
+void idnode_notify (idnode_t *in, const char *action);
+void idnode_notify_changed (void *in);
 void idnode_notify_title_changed (void *in);
 
 void idclass_register ( const idclass_t *idc );
@@ -203,7 +203,7 @@ static inline idnode_set_t * idnode_set_create(int sorted)
     is->is_sorted = sorted; return is; }
 void idnode_set_add
   ( idnode_set_t *is, idnode_t *in, idnode_filter_t *filt );
-void idnode_set_remove ( idnode_set_t *is, idnode_t *in );
+int idnode_set_remove ( idnode_set_t *is, idnode_t *in );
 ssize_t idnode_set_find_index( idnode_set_t *is, idnode_t *in );
 static inline int idnode_set_exists ( idnode_set_t *is, idnode_t *in )
   { return idnode_set_find_index(is, in) >= 0; }

@@ -137,9 +137,10 @@ tvheadend.epgDetails = function(event) {
     
     var now = new Date();
     var buttons = [];
-    var recording = event.dvrState.indexOf('recording') == 0;
+    var recording = event.dvrState.indexOf('recording') === 0;
+    var scheduled = event.dvrState.indexOf('scheduled') === 0;
 
-    if (!recording) {
+    if (!recording && !scheduled) {
         buttons.push(new Ext.Button({
             disabled: !event.title,
             handler: searchIMDB,
@@ -181,7 +182,16 @@ tvheadend.epgDetails = function(event) {
               handler: stopDVR,
               iconCls: 'stopRec',
               tooltip: 'Stop recording of this program',
-              text: "Stop record"
+              text: "Stop recording"
+          }));
+        }
+
+        if (scheduled) {
+          buttons.push(new Ext.Button({
+              handler: deleteDVR,
+              iconCls: 'remove',
+              tooltip: 'Delete scheduled recording of this program',
+              text: "Delete recording"
           }));
         }
 
@@ -261,12 +271,25 @@ tvheadend.epgDetails = function(event) {
         tvheadend.AjaxConfirm({
             url: 'api/dvr/entry/cancel',
             params: {
-                uuid: event.dvrUuid,
+                uuid: event.dvrUuid
             },
             success: function(d) {
                 win.close();
             },
-            question: 'Do you really want to abort/unschedule this event?'
+            question: 'Do you really want to abort/unschedule this recording?'
+        });
+    }
+
+    function deleteDVR() {
+        tvheadend.AjaxConfirm({
+            url: 'api/idnode/delete',
+            params: {
+                uuid: event.dvrUuid
+            },
+            success: function(d) {
+                win.close();
+            },
+            question: 'Do you really want to remove this recording?'
         });
     }
 
@@ -290,20 +313,31 @@ tvheadend.epgDetails = function(event) {
 tvheadend.epg = function() {
     var lookup = '<span class="x-linked">&nbsp;</span>';
 
+    var detailsfcn = function(grid, rec, act, row) {
+        new tvheadend.epgDetails(grid.getStore().getAt(row).data);
+    };
+
     var actions = new Ext.ux.grid.RowActions({
         id: 'details',
         header: 'Details',
         width: 45,
         dataIndex: 'actions',
+        callbacks: {
+            'recording':      detailsfcn,
+            'recordingError': detailsfcn,
+            'scheduled':      detailsfcn,
+            'completed':      detailsfcn,
+            'completedError': detailsfcn
+        },
         actions: [
             {
                 iconCls: 'broadcast_details',
                 qtip: 'Broadcast details',
-                cb: function(grid, rec, act, row) {
-                    new tvheadend.epgDetails(grid.getStore().getAt(row).data);
-                }
+                cb: detailsfcn
             },
-            { iconIndex: 'dvrState' }
+            {
+                iconIndex: 'dvrState'
+            }
                                                                                                           
         ]
     });
@@ -562,6 +596,10 @@ tvheadend.epg = function() {
         width: 200
     });
 
+    var epgFilterFulltext = new Ext.form.Checkbox({
+        width: 20
+    });
+
     // Channels, uses global store
 
     var epgFilterChannels = new Ext.form.ComboBox({
@@ -662,6 +700,11 @@ tvheadend.epg = function() {
         epgFilterTitle.setValue("");
     };
 
+    clearFulltextFilter = function() {
+        delete epgStore.baseParams.fulltext;
+        epgFilterFulltext.setValue(0);
+    };
+
     clearChannelFilter = function() {
         delete epgStore.baseParams.channel;
         epgFilterChannels.setValue("");
@@ -685,6 +728,7 @@ tvheadend.epg = function() {
 
     function epgQueryClear() {
         clearTitleFilter();
+        clearFulltextFilter();
         clearChannelFilter();
         clearChannelTagsFilter();
         clearDurationFilter();
@@ -752,6 +796,13 @@ tvheadend.epg = function() {
         }
     });
 
+    epgFilterFulltext.on('check', function(c, value) {
+        if (epgStore.baseParams.fulltext !== value) {
+            epgStore.baseParams.fulltext = value;
+            epgView.reset();
+        }
+    });
+
     var epgView = new Ext.ux.grid.livegrid.GridView({
         nearLimit: 100,
         loadMask: {
@@ -777,7 +828,7 @@ tvheadend.epg = function() {
     });
 
     var tbar = [
-        epgFilterTitle, '-',
+        epgFilterTitle, { text: 'Fulltext' }, epgFilterFulltext, '-',
         epgFilterChannels, '-',
         epgFilterChannelTags, '-',
         epgFilterContentGroup, '-',
@@ -842,14 +893,60 @@ tvheadend.epg = function() {
     });
 
     /**
-     * Listener for DVR notifications. We want to update the EPG grid when a
-     * recording is finished/deleted etc. so the status icon gets updated. 
-     * Only do this when the tab is visible, otherwise it won't work as 
-     * expected.
+     * Listener for EPG and DVR notifications.
+     * We want to update the EPG grid when a recording is finished/deleted etc.
+     * so the status icon gets updated. Only do this when the tab is visible,
+     * otherwise it won't work as expected.
      */
-    tvheadend.comet.on('dvrentry', function() {
-        if (panel.isVisible())
-            epgStore.reload();
+    tvheadend.comet.on('epg', function(m) {
+        if (!panel.isVisible())
+            return;
+        if ('delete' in m) {
+            for (var i = 0; i < m['delete'].length; i++) {
+                var r = epgStore.getById(m['delete'][i]);
+                if (r)
+                  epgStore.remove(r);
+            }
+        }
+        if (m.update || m.dvr_update || m.dvr_delete) {
+            var a = m.update || m.dvr_update || m.dvr_delete;
+            if (m.update && m.dvr_update)
+                var a = m.update.concat(m.dvr_update);
+            if (m.update || m.dvr_update)
+                a = a.concat(m.dvr_delete);
+            var ids = [];
+            for (var i = 0; i < a.length; i++) {
+                var r = epgStore.getById(a[i]);
+                if (r)
+                  ids.push(r.id);
+            }
+            if (ids) {
+                Ext.Ajax.request({
+                    url: 'api/epg/events/load',
+                    params: {
+                        eventId: ids
+                    },
+                    success: function(d) {
+                        d = json_decode(d);
+                        for (var i = 0; i < d.length; i++) {
+                            var r = epgStore.getById(d[i].eventId);
+                            if (r) {
+                                for (var j = 0; j < r.store.fields.items.length; j++) {
+                                    var n = r.store.fields.items[j];
+                                    var v = d[i][n.name];
+                                    r.data[n.name] = n.convert((v !== undefined) ? v : n.defaultValue, v);
+                                }
+                                r.json = d[i];
+                                r.commit();
+                            }
+                        }
+                    },
+                    failure: function(response, options) {
+                        Ext.MessageBox.alert('EPG Update', response.statusText);
+                    }
+                });
+            }
+        }
     });
     
     // Always reload the store when the tab is activated
@@ -898,6 +995,7 @@ tvheadend.epg = function() {
 
         var title = epgStore.baseParams.title ? epgStore.baseParams.title
                 : "<i>Don't care</i>";
+        var fulltext = epgStore.baseParams.fulltext ? " <i>(Fulltext)</i>" : "";
         var channel = epgStore.baseParams.channel ? tvheadend.channelLookupName(epgStore.baseParams.channel)
                 : "<i>Don't care</i>";
         var tag = epgStore.baseParams.channelTag ? tvheadend.channelTagLookupName(epgStore.baseParams.channelTag)
@@ -910,7 +1008,7 @@ tvheadend.epg = function() {
         Ext.MessageBox.confirm('Auto Recorder', 'This will create an automatic rule that '
                 + 'continuously scans the EPG for programmes '
                 + 'to record that match this query: ' + '<br><br>'
-                + '<div class="x-smallhdr">Title:</div>' + title + '<br>'
+                + '<div class="x-smallhdr">Title:</div>' + title + fulltext + '<br>'
                 + '<div class="x-smallhdr">Channel:</div>' + channel + '<br>'
                 + '<div class="x-smallhdr">Tag:</div>' + tag + '<br>'
                 + '<div class="x-smallhdr">Genre:</div>' + contentType + '<br>'
@@ -931,6 +1029,7 @@ tvheadend.epg = function() {
           comment: 'Created from EPG query'
         };
         if (params.title) conf.title = params.title;
+        if (params.fulltext) conf.fulltext = params.fulltext;
         if (params.channel) conf.channel = params.channel;
         if (params.channelTag) conf.tag = params.channelTag;
         if (params.contentType) conf.content_type = params.contentType;

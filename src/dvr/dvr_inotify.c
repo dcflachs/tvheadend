@@ -93,23 +93,17 @@ void dvr_inotify_add ( dvr_entry_t *de )
 {
   dvr_inotify_entry_t *e;
   char *path;
-  struct stat st;
 
   if (_inot_fd < 0)
     return;
 
-  if (!de->de_filename || stat(de->de_filename, &st))
+  if (!de->de_filename || de->de_filename[0] == '\0')
     return;
 
   path = strdup(de->de_filename);
 
   SKEL_ALLOC(dvr_inotify_entry_skel);
   dvr_inotify_entry_skel->path = dirname(path);
-  
-  if (stat(dvr_inotify_entry_skel->path, &st)) {
-    free(path);
-    return;
-  }
   
   e = RB_INSERT_SORTED(&_inot_tree, dvr_inotify_entry_skel, link, _str_cmp);
   if (!e) {
@@ -135,8 +129,9 @@ void dvr_inotify_add ( dvr_entry_t *de )
  */
 void dvr_inotify_del ( dvr_entry_t *de )
 {
-  dvr_entry_t *det;
+  dvr_entry_t *det = NULL;
   dvr_inotify_entry_t *e;
+  lock_assert(&global_lock);
   RB_FOREACH(e, &_inot_tree, link) {
     LIST_FOREACH(det, &e->entries, de_inotify_link)
       if (det == de) break;
@@ -213,7 +208,7 @@ _dvr_inotify_moved
     dvr_inotify_del(de);
   
   htsp_dvr_entry_update(de);
-  idnode_notify_simple(&de->de_id);
+  idnode_notify_changed(&de->de_id);
 }
 
 /*
@@ -241,7 +236,7 @@ _dvr_inotify_moved_all
 
   while ((de = LIST_FIRST(&die->entries))) {
     htsp_dvr_entry_update(de);
-    idnode_notify_simple(&de->de_id);
+    idnode_notify_changed(&de->de_id);
     dvr_inotify_del(de);
   }
 }

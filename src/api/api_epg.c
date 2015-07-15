@@ -289,11 +289,12 @@ api_epg_grid
   memset(&eq, 0, sizeof(eq));
 
   lang = htsmsg_get_str(args, "lang");
-  eq.lang = lang ? strdup(lang) : NULL;
-
+  if (lang)
+    eq.lang = strdup(lang);
   str = htsmsg_get_str(args, "title");
   if (str)
     eq.stitle = strdup(str);
+  eq.fulltext = htsmsg_get_bool_or_default(args, "fulltext", 0);
   str = htsmsg_get_str(args, "channel");
   if (str)
     eq.channel = strdup(str);
@@ -483,6 +484,7 @@ api_epg_alternative
   pthread_mutex_unlock(&global_lock);
 
   /* Build response */
+  *resp = htsmsg_create_map();
   htsmsg_add_u32(*resp, "totalCount", entries);
   htsmsg_add_msg(*resp, "entries", l);
 
@@ -523,6 +525,51 @@ api_epg_related
   pthread_mutex_unlock(&global_lock);
 
   /* Build response */
+  *resp = htsmsg_create_map();
+  htsmsg_add_u32(*resp, "totalCount", entries);
+  htsmsg_add_msg(*resp, "entries", l);
+
+  return 0;
+}
+
+static int
+api_epg_load
+  ( access_t *perm, void *opaque, const char *op, htsmsg_t *args, htsmsg_t **resp )
+{
+  uint32_t id = 0, entries = 0;
+  htsmsg_t *l = htsmsg_create_list(), *ids = NULL, *m;
+  htsmsg_field_t *f;
+  epg_broadcast_t *e;
+  const char *lang = htsmsg_get_str(args, "lang");
+
+  if (!(f = htsmsg_field_find(args, "eventId")))
+    return -EINVAL;
+  if (!(ids = htsmsg_field_get_list(f)))
+    if (htsmsg_field_get_u32(f, &id))
+      return -EINVAL;
+
+  /* Main Job */
+  pthread_mutex_lock(&global_lock);
+  if (ids) {
+    HTSMSG_FOREACH(f, ids) {
+      if (htsmsg_field_get_u32(f, &id)) continue;
+      e = epg_broadcast_find_by_id(id);
+      if (e == NULL) continue;
+      if ((m = api_epg_entry(e, lang, perm)) == NULL) continue;
+      htsmsg_add_msg(l, NULL, m);
+      entries++;
+    }
+  } else {
+    e = epg_broadcast_find_by_id(id);
+    if (e != NULL && (m = api_epg_entry(e, lang, perm)) != NULL) {
+      htsmsg_add_msg(l, NULL, m);
+      entries++;
+    }
+  }
+  pthread_mutex_unlock(&global_lock);
+
+  /* Build response */
+  *resp = htsmsg_create_map();
   htsmsg_add_u32(*resp, "totalCount", entries);
   htsmsg_add_msg(*resp, "entries", l);
 
@@ -564,6 +611,7 @@ void api_epg_init ( void )
     { "epg/events/grid",        ACCESS_ANONYMOUS, api_epg_grid, NULL },
     { "epg/events/alternative", ACCESS_ANONYMOUS, api_epg_alternative, NULL },
     { "epg/events/related",     ACCESS_ANONYMOUS, api_epg_related, NULL },
+    { "epg/events/load",        ACCESS_ANONYMOUS, api_epg_load, NULL },
     { "epg/brand/list",         ACCESS_ANONYMOUS, api_epg_brand_list, NULL },
     { "epg/content_type/list",  ACCESS_ANONYMOUS, api_epg_content_type_list, NULL },
 

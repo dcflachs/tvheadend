@@ -41,7 +41,8 @@ typedef struct tvhcsa
   int      csa_type;   /*< see DESCRAMBLER_* defines */
   int      csa_keylen;
   void   (*csa_descramble)
-              ( struct tvhcsa *csa, struct mpegts_service *s, const uint8_t *tsb );
+              ( struct tvhcsa *csa, struct mpegts_service *s,
+                const uint8_t *tsb, int len );
   void   (*csa_flush)
               ( struct tvhcsa *csa, struct mpegts_service *s );
 
@@ -64,6 +65,8 @@ typedef struct tvhcsa
   
 } tvhcsa_t;
 
+#if ENABLE_TVHCSA
+
 int  tvhcsa_set_type( tvhcsa_t *csa, int type );
 
 void tvhcsa_set_key_even( tvhcsa_t *csa, const uint8_t *even );
@@ -71,5 +74,17 @@ void tvhcsa_set_key_odd ( tvhcsa_t *csa, const uint8_t *odd );
 
 void tvhcsa_init    ( tvhcsa_t *csa );
 void tvhcsa_destroy ( tvhcsa_t *csa );
+
+#else
+
+static inline int tvhcsa_set_type( tvhcsa_t *csa, int type ) { return -1; }
+
+static inline void tvhcsa_set_key_even( tvhcsa_t *csa, const uint8_t *even ) { };
+static inline void tvhcsa_set_key_odd ( tvhcsa_t *csa, const uint8_t *odd ) { };
+
+static inline void tvhcsa_init ( tvhcsa_t *csa ) { };
+static inline void tvhcsa_destroy ( tvhcsa_t *csa ) { };
+
+#endif
 
 #endif /* __TVH_CSA_H__ */

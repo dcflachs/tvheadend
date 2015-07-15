@@ -289,7 +289,7 @@ htsmsg_add_binptr(htsmsg_t *msg, const char *name, const void *bin, size_t len)
 /*
  *
  */
-void
+htsmsg_t *
 htsmsg_add_msg(htsmsg_t *msg, const char *name, htsmsg_t *sub)
 {
   htsmsg_field_t *f;
@@ -301,6 +301,11 @@ htsmsg_add_msg(htsmsg_t *msg, const char *name, htsmsg_t *sub)
   f->hmf_msg.hm_islist = sub->hm_islist;
   TAILQ_MOVE(&f->hmf_msg.hm_fields, &sub->hm_fields, hmf_link);
   free(sub);
+
+  if (f->hmf_type == (f->hmf_msg.hm_islist ? HMF_LIST : HMF_MAP))
+    return &f->hmf_msg;
+
+  return NULL;
 }
 
 
@@ -366,6 +371,18 @@ htsmsg_field_get_s64
  */
 
 int
+bool_check(const char *str)
+{
+  if (str &&
+      (!strcmp(str, "yes")  ||
+       !strcmp(str, "true") ||
+       !strcmp(str, "on") ||
+       !strcmp(str, "1")))
+    return 1;
+  return 0;
+}
+
+int
 htsmsg_field_get_bool
   ( htsmsg_field_t *f, int *boolp )
 {
@@ -373,13 +390,7 @@ htsmsg_field_get_bool
   default:
     return HTSMSG_ERR_CONVERSION_IMPOSSIBLE;
   case HMF_STR:
-    if (!strcmp(f->hmf_str, "yes")  ||
-        !strcmp(f->hmf_str, "true") ||
-        !strcmp(f->hmf_str, "on") ||
-        !strcmp(f->hmf_str, "1"))
-      *boolp = 1;
-    else
-      *boolp = 0;
+    *boolp = bool_check(f->hmf_str);
     break;
   case HMF_S64:
     *boolp = f->hmf_s64 ? 1 : 0;

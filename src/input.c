@@ -18,9 +18,17 @@
 
 #include "input.h"
 #include "notify.h"
+#include "access.h"
 
 tvh_input_list_t    tvh_inputs;
 tvh_hardware_list_t tvh_hardware;
+
+const idclass_t tvh_input_instance_class =
+{
+  .ic_class      = "tvh_input_instance",
+  .ic_caption    = "Input Instance",
+  .ic_perm_def   = ACCESS_ADMIN
+};
 
 /*
  * Create entry
@@ -43,6 +51,8 @@ tvh_hardware_create0
   /* Load config */
   if (conf)
     idnode_load(&th->th_id, conf);
+
+  notify_reload("hardware");
   
   return o;
 }
@@ -57,6 +67,24 @@ tvh_hardware_delete ( tvh_hardware_t *th )
   // TODO
   LIST_REMOVE(th, th_link);
   idnode_unlink(&th->th_id);
+  notify_reload("hardware");
+}
+
+/*
+ *
+ */
+
+void
+tvh_input_instance_clear_stats ( tvh_input_instance_t *tii )
+{
+  tvh_input_stream_stats_t *s = &tii->tii_stats;
+
+  atomic_exchange(&s->ber, 0);
+  atomic_exchange(&s->unc, 0);
+  atomic_exchange(&s->cc, 0);
+  atomic_exchange(&s->te, 0);
+  atomic_exchange(&s->ec_block, 0);
+  atomic_exchange(&s->tc_block, 0);
 }
 
 /*
@@ -75,10 +103,10 @@ tvh_input_stream_create_msg
     htsmsg_add_str(m, "stream", st->stream_name);
   htsmsg_add_u32(m, "subs", st->subs_count);
   htsmsg_add_u32(m, "weight", st->max_weight);
-  htsmsg_add_u32(m, "signal", st->stats.signal);
+  htsmsg_add_s32(m, "signal", st->stats.signal);
   htsmsg_add_u32(m, "signal_scale", st->stats.signal_scale);
   htsmsg_add_u32(m, "ber", st->stats.ber);
-  htsmsg_add_u32(m, "snr", st->stats.snr);
+  htsmsg_add_s32(m, "snr", st->stats.snr);
   htsmsg_add_u32(m, "snr_scale", st->stats.snr_scale);
   htsmsg_add_u32(m, "unc", st->stats.unc);
   htsmsg_add_u32(m, "bps", st->stats.bps);

@@ -1,6 +1,6 @@
 /*
  *  tvheadend, HTTP interface
- *  Copyright (C) 2007 Andreas Öman
+ *  Copyright (C) 2007 Andreas Ã–man
  *
  *  This program is free software: you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -22,9 +22,12 @@
 #include "htsbuf.h"
 #include "url.h"
 #include "tvhpoll.h"
-#include "access.h"
+  #include "access.h"
 
 struct channel;
+struct http_path;
+
+typedef LIST_HEAD(, http_path) http_path_list_t;
 
 typedef TAILQ_HEAD(http_arg_list, http_arg) http_arg_list_t;
 
@@ -71,12 +74,17 @@ typedef struct http_arg {
 #define HTTP_STATUS_UNSUPPORTED     415
 #define HTTP_STATUS_BAD_RANGE       417
 #define HTTP_STATUS_EXPECTATION     418
+#define HTTP_STATUS_BANDWIDTH       453
+#define HTTP_STATUS_BAD_SESSION     454
+#define HTTP_STATUS_METHOD_INVALID  455
+#define HTTP_STATUS_BAD_TRANSFER    456
 #define HTTP_STATUS_INTERNAL        500
 #define HTTP_STATUS_NOT_IMPLEMENTED 501
 #define HTTP_STATUS_BAD_GATEWAY     502
 #define HTTP_STATUS_SERVICE         503
 #define HTTP_STATUS_GATEWAY_TIMEOUT 504
 #define HTTP_STATUS_HTTP_VERSION    505
+#define HTTP_STATUS_OP_NOT_SUPPRT   551
 
 typedef enum http_state {
   HTTP_CON_WAIT_REQUEST,
@@ -92,6 +100,7 @@ typedef enum http_state {
 } http_state_t;
 
 typedef enum http_cmd {
+  HTTP_CMD_NONE,
   HTTP_CMD_GET,
   HTTP_CMD_HEAD,
   HTTP_CMD_POST,
@@ -112,8 +121,12 @@ typedef enum http_ver {
 typedef struct http_connection {
   int hc_fd;
   struct sockaddr_storage *hc_peer;
+  char *hc_peer_ipstr;
   struct sockaddr_storage *hc_self;
   char *hc_representative;
+
+  http_path_list_t *hc_paths;
+  int (*hc_process)(struct http_connection *hc, htsbuf_queue_t *spill);
 
   char *hc_url;
   char *hc_url_orig;
@@ -138,6 +151,8 @@ typedef struct http_connection {
   int hc_no_output;
   int hc_logout_cookie;
   int hc_shutdown;
+  uint64_t hc_cseq;
+  char *hc_session;
 
   /* Support for HTTP POST */
   
@@ -146,6 +161,7 @@ typedef struct http_connection {
 
 } http_connection_t;
 
+extern void *http_server;
 
 const char *http_cmd2str(int val);
 int http_str2cmd(const char *str);
@@ -160,12 +176,15 @@ static inline void http_arg_init(struct http_arg_list *list)
 void http_arg_flush(struct http_arg_list *list);
 
 char *http_arg_get(struct http_arg_list *list, const char *name);
+char *http_arg_get_remove(struct http_arg_list *list, const char *name);
 
 void http_arg_set(struct http_arg_list *list, const char *key, const char *val);
 
 int http_tokenize(char *buf, char **vec, int vecsize, int delimiter);
 
 void http_error(http_connection_t *hc, int error);
+
+int http_encoding_valid(http_connection_t *hc, const char *encoding);
 
 void http_output_html(http_connection_t *hc);
 
@@ -177,7 +196,11 @@ void http_redirect(http_connection_t *hc, const char *location,
 void http_send_header(http_connection_t *hc, int rc, const char *content, 
 		      int64_t contentlen, const char *encoding,
 		      const char *location, int maxage, const char *range,
-		      const char *disposition);
+		      const char *disposition, http_arg_list_t *args);
+
+void http_serve_requests(http_connection_t *hc);
+
+void http_cancel(void *opaque);
 
 typedef int (http_callback_t)(http_connection_t *hc, 
 			      const char *remain, void *opaque);
@@ -213,6 +236,8 @@ int http_access_verify_channel(http_connection_t *hc, int mask,
 
 void http_deescape(char *s);
 
+void http_parse_get_args(http_connection_t *hc, char *args);
+
 /*
  * HTTP/RTSP Client
  */
@@ -235,6 +260,7 @@ struct http_client {
 
   TAILQ_ENTRY(http_client) hc_link;
 
+  int          hc_id;
   int          hc_fd;
   char        *hc_scheme;
   char        *hc_host;
@@ -296,8 +322,12 @@ struct http_client {
   int          hc_rtp_multicast:1;
   long         hc_rtsp_stream_id;
   int          hc_rtp_timeout;
+  char        *hc_rtsp_user;
+  char        *hc_rtsp_pass;
 
   struct http_client_ssl *hc_ssl; /* ssl internals */
+
+  gtimer_t     hc_close_timer;
 
   /* callbacks */
   int     (*hc_hdr_received) (http_client_t *hc);
@@ -318,6 +348,8 @@ void http_client_close ( http_client_t *hc );
 int http_client_send( http_client_t *hc, http_cmd_t cmd,
                       const char *path, const char *query,
                       http_arg_list_t *header, void *body, size_t body_size );
+void http_client_basic_auth( http_client_t *hc, http_arg_list_t *h,
+                             const char *user, const char *pass );
 int http_client_simple( http_client_t *hc, const url_t *url);
 int http_client_clear_state( http_client_t *hc );
 int http_client_run( http_client_t *hc );

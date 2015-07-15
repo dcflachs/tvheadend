@@ -1,6 +1,6 @@
 /*
  *  Service Mapper functions
- *  Copyright (C) 2007 Andreas Öman
+ *  Copyright (C) 2007 Andreas Ã–man
  *
  *  This program is free software: you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -184,11 +184,11 @@ service_mapper_notify ( channel_service_mapping_t *csm, void *origin )
   if (origin == NULL)
     return;
   if (origin == csm->csm_svc) {
-    idnode_notify_simple(&csm->csm_chn->ch_id);
+    idnode_notify_changed(&csm->csm_chn->ch_id);
     channel_save(csm->csm_chn);
   }
   if (origin == csm->csm_chn)
-    idnode_notify_simple(&csm->csm_svc->s_id);
+    idnode_notify_changed(&csm->csm_svc->s_id);
 }
 
 /*
@@ -315,7 +315,7 @@ service_mapper_process ( service_t *s, bouquet_t *bq )
         channel_tag_map(chn, channel_tag_find_by_name(prov, 1));
 
     /* save */
-    idnode_notify_simple(&chn->ch_id);
+    idnode_notify_changed(&chn->ch_id);
     channel_save(chn);
   }
   if (!bq) {
@@ -375,9 +375,11 @@ service_mapper_thread ( void *aux )
     /* Subscribe */
     tvhinfo("service_mapper", "checking %s", s->s_nicename);
     prch.prch_id = s;
-    sub = subscription_create_from_service(&prch, SUBSCRIPTION_PRIO_MAPPER,
+    sub = subscription_create_from_service(&prch, NULL,
+                                           SUBSCRIPTION_PRIO_MAPPER,
                                            "service_mapper",
-                                           0, NULL, NULL, "service_mapper");
+                                           SUBSCRIPTION_PACKET,
+                                           NULL, NULL, "service_mapper", NULL);
 
     /* Failed */
     if (!sub) {
@@ -433,7 +435,7 @@ service_mapper_thread ( void *aux )
     pthread_mutex_unlock(&sq->sq_mutex);
  
     pthread_mutex_lock(&global_lock);
-    subscription_unsubscribe(sub);
+    subscription_unsubscribe(sub, 0);
 
     if(err) {
       tvhinfo("service_mapper", "%s: failed [err %s]", s->s_nicename, err);

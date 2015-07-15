@@ -42,7 +42,8 @@ static struct strtab container_audio_mime[] = {
   { "audio/x-matroska",         MC_MATROSKA },
   { "audio/x-matroska",         MC_AVMATROSKA },
   { "audio/webm",               MC_WEBM },
-  { "audio/x-mpegts",           MC_MPEGTS },
+  { "audio/webm",               MC_AVWEBM },
+  { "audio/mp2t",               MC_MPEGTS },
   { "audio/mpeg",               MC_MPEGPS },
   { "application/octet-stream", MC_PASS },
   { "application/octet-stream", MC_RAW },
@@ -57,7 +58,8 @@ static struct strtab container_video_mime[] = {
   { "video/x-matroska",         MC_MATROSKA },
   { "video/x-matroska",         MC_AVMATROSKA },
   { "video/webm",               MC_WEBM },
-  { "video/x-mpegts",           MC_MPEGTS },
+  { "video/webm",               MC_AVWEBM },
+  { "video/mp2t",               MC_MPEGTS },
   { "video/mpeg",               MC_MPEGPS },
   { "application/octet-stream", MC_PASS },
   { "application/octet-stream", MC_RAW },
@@ -76,6 +78,7 @@ static struct strtab container_name[] = {
   { "pass",       MC_PASS },
   { "raw",        MC_RAW },
   { "avmatroska", MC_AVMATROSKA },
+  { "avwebm",     MC_AVWEBM },
 };
 
 
@@ -91,6 +94,7 @@ static struct strtab container_audio_file_suffix[] = {
   { "bin",  MC_PASS },
   { "bin",  MC_RAW },
   { "mka",  MC_AVMATROSKA },
+  { "webm", MC_AVWEBM },
 };
 
 
@@ -106,6 +110,7 @@ static struct strtab container_video_file_suffix[] = {
   { "bin",  MC_PASS },
   { "bin",  MC_RAW },
   { "mkv",  MC_AVMATROSKA },
+  { "webm", MC_AVWEBM },
 };
 
 

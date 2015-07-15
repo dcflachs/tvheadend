@@ -17,6 +17,8 @@ CONFIGURE_ARGS="$*"
 [ -z "$ARCH"     ] && ARCH=$(uname -m)
 [ -z "$OSENV"    ] && OSENV=posix
 [ -z "$PYTHON"   ] && PYTHON=python
+[ -z "$GZIPCMD"  ] && GZIPCMD=gzip
+[ -z "$BZIP2"    ] && BZIP2=bzip2
 
 # Paths
 [ -z "$prefix"   ] && prefix=/usr/local
@@ -204,11 +206,11 @@ check_pkg ()
 
   printf "$TAB" "checking for pkg $pkg $ver ..."
 
-  dver=$(pkg-config --modversion $pkg 2> /dev/null)
+  dver=$(${PKG_CONFIG} --modversion $pkg 2> /dev/null)
   test -z "$dver" && dver="<none>"
 
   # Check for package
-  if pkg-config $pkg $cver; then
+  if ${PKG_CONFIG} $pkg $cver; then
     echo "ok (detected ${dver})"
     enable_pkg $pkg
   else
@@ -398,6 +400,8 @@ print_config ()
 
   echo "Binaries:"
   printf "$fmt" "Using PYTHON:" "${PYTHON}"
+  printf "$fmt" "Using GZIP:" "${GZIPCMD}"
+  printf "$fmt" "Using BZIP2:" "${BZIP2}"
   echo ""
 
   # Options
@@ -416,7 +420,7 @@ print_config ()
   # Packages
   echo "Packages:"
   for pkg in ${PACKAGES[*]}; do
-    printf "$fmt" "${pkg}" "$(pkg-config --modversion $pkg)"
+    printf "$fmt" "${pkg}" "$(${PKG_CONFIG} --modversion $pkg)"
   done
   echo ""
   
@@ -455,6 +459,8 @@ ifeq (\$(origin CC),default)
 CC        = ${CC}
 endif
 PYTHON   ?= ${PYTHON}
+GZIPCMD  ?= ${GZIPCMD}
+BZIP2    ?= ${BZIP2}
 CFLAGS   += ${CFLAGS}
 LDFLAGS  += ${LDFLAGS}
 prefix    = ${prefix}
@@ -478,8 +484,8 @@ EOF
   # Add package config
   for pkg in ${PACKAGES[*]}; do
     cat >>"${CONFIG_MK}" <<EOF
-LDFLAGS += $(pkg-config --libs $pkg)
-CFLAGS  += $(pkg-config --cflags $pkg)
+LDFLAGS += $(${PKG_CONFIG} --libs $pkg)
+CFLAGS  += $(${PKG_CONFIG} --cflags $pkg)
 EOF
   done
 

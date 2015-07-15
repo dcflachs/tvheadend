@@ -42,15 +42,23 @@ mpegts_table_consistency_check ( mpegts_mux_t *mm )
 }
 
 static void
-mpegts_table_fastswitch ( mpegts_mux_t *mm )
+mpegts_table_fastswitch ( mpegts_mux_t *mm, mpegts_table_t *mtm )
 {
   char buf[256];
   mpegts_table_t   *mt;
 
-  if(mm->mm_scan_state != MM_SCAN_STATE_ACTIVE)
-    return;
+  assert(mm == mtm->mt_mux);
 
   pthread_mutex_lock(&mm->mm_tables_lock);
+
+  if ((mtm->mt_flags & MT_ONESHOT) && (mtm->mt_complete && !mtm->mt_working))
+    mm->mm_unsubscribe_table(mm, mtm);
+
+  if (mm->mm_scan_state != MM_SCAN_STATE_ACTIVE) {
+    pthread_mutex_unlock(&mm->mm_tables_lock);
+    return;
+  }
+
   LIST_FOREACH(mt, &mm->mm_tables, mt_link) {
     if (!(mt->mt_flags & MT_QUICKREQ) && !mt->mt_working)
       continue;
@@ -59,6 +67,7 @@ mpegts_table_fastswitch ( mpegts_mux_t *mm )
       return;
     }
   }
+
   pthread_mutex_unlock(&mm->mm_tables_lock);
 
   mpegts_mux_nice_name(mm, buf, sizeof(buf));
@@ -70,76 +79,41 @@ void
 mpegts_table_dispatch
   ( const uint8_t *sec, size_t r, void *aux )
 {
-  int tid, len, ret;
+  int tid, len, crc_len, ret;
   mpegts_table_t *mt = aux;
-  int chkcrc = mt->mt_flags & MT_CRC;
 
   if(mt->mt_destroyed)
     return;
 
-  /* Table info */
   tid = sec[0];
-  len = ((sec[1] & 0x0f) << 8) | sec[2];
-
-  if (tid == 0x72) { /* stuffing section */
-    if (len != r - 3) {
-      if (tvhlog_limit(&mt->mt_err_log, 10))
-        tvhwarn(mt->mt_name, "stuffing found with trailing data "
-                             "(len %i, total %zi, errors %zi)",
-                             len, r, mt->mt_err_log.count);
-    }
-    dvb_table_reset(mt);
-    return;
-  }
-
-  /* It seems some hardware (or is it the dvb API?) does not
-     honour the DMX_CHECK_CRC flag, so we check it again */
-  if(chkcrc && tvh_crc32(sec, r, 0xffffffff)) {
-    if (tvhlog_limit(&mt->mt_err_log, 10))
-      tvhwarn(mt->mt_name, "invalid checksum (len %zi, errors %zi)",
-                           r, mt->mt_err_log.count);
-    return;
-  }
-
-  /* Not enough data */
-  if(len < r - 3) {
-    tvhtrace(mt->mt_name, "not enough data, %d < %d", (int)r, len);
-    return;
-  }
 
   /* Check table mask */
   if((tid & mt->mt_mask) != mt->mt_table)
     return;
 
-  /* Strip trailing CRC */
-  if(chkcrc)
-    len -= 4;
+  len = ((sec[1] & 0x0f) << 8) | sec[2];
+  crc_len = (mt->mt_flags & MT_CRC) ? 4 : 0;
 
   /* Pass with tableid / len in data */
   if (mt->mt_flags & MT_FULL)
-    ret = mt->mt_callback(mt, sec, len+3, tid);
+    ret = mt->mt_callback(mt, sec, len+3-crc_len, tid);
 
   /* Pass w/out tableid/len in data */
   else
-    ret = mt->mt_callback(mt, sec+3, len, tid);
+    ret = mt->mt_callback(mt, sec+3, len-crc_len, tid);
   
   /* Good */
   if(ret >= 0)
     mt->mt_count++;
 
   if(!ret && mt->mt_flags & (MT_QUICKREQ|MT_FASTSWITCH))
-    mpegts_table_fastswitch(mt->mt_mux);
+    mpegts_table_fastswitch(mt->mt_mux, mt);
 }
 
 void
 mpegts_table_release_ ( mpegts_table_t *mt )
 {
-  struct mpegts_table_state *st;
-
-  while ((st = RB_FIRST(&mt->mt_state))) {
-    RB_REMOVE(&mt->mt_state, st, link);
-    free(st);
-  }
+  dvb_table_release((mpegts_psi_table_t *)mt);
   tvhtrace("mpegts", "table: mux %p free %s %02X/%02X (%d) pid %04X (%d)",
            mt->mt_mux, mt->mt_name, mt->mt_table, mt->mt_mask, mt->mt_table,
            mt->mt_pid, mt->mt_pid);
@@ -203,7 +177,7 @@ mpegts_table_t *
 mpegts_table_add
   ( mpegts_mux_t *mm, int tableid, int mask,
     mpegts_table_callback_t callback, void *opaque,
-    const char *name, int flags, int pid )
+    const char *name, int flags, int pid, int weight )
 {
   mpegts_table_t *mt;
   int subscribe = 1;
@@ -219,6 +193,7 @@ mpegts_table_add
         continue;
       mt->mt_callback   = callback;
       mt->mt_pid        = pid;
+      mt->mt_weight     = weight;
       mt->mt_table      = tableid;
       mm->mm_open_table(mm, mt, 1);
     } else if (pid >= 0) {
@@ -241,16 +216,17 @@ mpegts_table_add
 
   /* Create */
   mt = calloc(1, sizeof(mpegts_table_t));
-  mt->mt_arefcount = 1;
-  mt->mt_name      = strdup(name);
-  mt->mt_callback  = callback;
-  mt->mt_opaque    = opaque;
-  mt->mt_pid       = pid;
-  mt->mt_flags     = flags & ~(MT_SKIPSUBS|MT_SCANSUBS);
-  mt->mt_table     = tableid;
-  mt->mt_mask      = mask;
-  mt->mt_mux       = mm;
-  mt->mt_cc        = -1;
+  mt->mt_arefcount  = 1;
+  mt->mt_name       = strdup(name);
+  mt->mt_callback   = callback;
+  mt->mt_opaque     = opaque;
+  mt->mt_pid        = pid;
+  mt->mt_weight     = weight;
+  mt->mt_flags      = flags & ~(MT_SKIPSUBS|MT_SCANSUBS);
+  mt->mt_table      = tableid;
+  mt->mt_mask       = mask;
+  mt->mt_mux        = mm;
+  mt->mt_sect.ps_cc = -1;
 
   /* Open table */
   if (pid < 0) {
@@ -294,96 +270,6 @@ mpegts_table_flush_all ( mpegts_mux_t *mm )
   assert(LIST_FIRST(&mm->mm_tables) == NULL);
   pthread_mutex_unlock(&mm->mm_tables_lock);
 }
-
-/*
- * Section assembly
- */
-static int
-mpegts_psi_section_reassemble0
-  ( mpegts_psi_section_t *ps, const uint8_t *data, 
-    int len, int start, int crc,
-    mpegts_psi_section_callback_t cb, void *opaque)
-{
-  int excess, tsize;
-
-  if(start) {
-    // Payload unit start indicator
-    ps->ps_offset = 0;
-    ps->ps_lock = 1;
-  }
-
-  if(!ps->ps_lock)
-    return -1;
-
-  memcpy(ps->ps_data + ps->ps_offset, data, len);
-  ps->ps_offset += len;
-
-  if(ps->ps_offset < 3) {
-    /* We don't know the total length yet */
-    return len;
-  }
-
-  tsize = 3 + (((ps->ps_data[1] & 0xf) << 8) | ps->ps_data[2]);
- 
-  if(ps->ps_offset < tsize)
-    return len; // Not there yet
-  
-  excess = ps->ps_offset - tsize;
-
-  if(crc && tvh_crc32(ps->ps_data, tsize, 0xffffffff))
-    return -1;
-
-  ps->ps_offset = 0;
-  if (cb)
-    cb(ps->ps_data, tsize - (crc ? 4 : 0), opaque);
-  return len - excess;
-}
-
-
-/**
- *
- */
-void
-mpegts_psi_section_reassemble
-  (mpegts_psi_section_t *ps, const uint8_t *tsb, int crc, int ccerr,
-   mpegts_psi_section_callback_t cb, void *opaque)
-{
-  int off  = tsb[3] & 0x20 ? tsb[4] + 5 : 4;
-  int pusi = tsb[1] & 0x40;
-  int r;
-
-  if (ccerr)
-    ps->ps_lock = 0;
-
-  if(off >= 188) {
-    ps->ps_lock = 0;
-    return;
-  }
-  
-  if(pusi) {
-    int len = tsb[off++];
-    if(len > 0) {
-      if(len > 188 - off) {
-        ps->ps_lock = 0;
-        return;
-      }
-      mpegts_psi_section_reassemble0(ps, tsb + off, len, 0, crc, cb, opaque);
-      off += len;
-    }
-  }
-
-  while(off < 188) {
-    r = mpegts_psi_section_reassemble0(ps, tsb + off, 188 - off, pusi, crc,
-        cb, opaque);
-    if(r < 0) {
-      ps->ps_lock = 0;
-      break;
-    }
-    off += r;
-    pusi = 0;
-  }
-}
-
 
 
 /******************************************************************************

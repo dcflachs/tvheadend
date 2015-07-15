@@ -117,6 +117,7 @@ static int _lang_str_add
   if (!str) return 0;
 
   /* Get proper code */
+  if (!lang) lang = lang_code_preferred();
   if (!(lang = lang_code_get(lang))) return 0;
 
   /* Create skel */
@@ -249,6 +250,14 @@ int lang_str_compare( lang_str_t *ls1, lang_str_t *ls2 )
     if (r) return r;
   }
   return 0;
+}
+
+int strempty(const char* c) {
+  return !c || c[0] == 0;
+}
+
+int lang_str_empty(lang_str_t* str) {
+  return strempty(lang_str_get(str, NULL));
 }
 
 void lang_str_done( void )

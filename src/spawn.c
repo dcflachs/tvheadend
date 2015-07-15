@@ -1,6 +1,6 @@
 /*
  *  Process spawn functions
- *  Copyright (C) 2008 Andreas Öman
+ *  Copyright (C) 2008 Andreas Ã–man
  *
  *  This program is free software: you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -230,15 +230,22 @@ find_exec ( const char *name, char *out, size_t len )
  * Reap one child
  */
 int
-spawn_reap(char *stxt, size_t stxtlen)
+spawn_reap(pid_t wpid, char *stxt, size_t stxtlen)
 {
   pid_t pid;
   int status, res;
   spawn_t *s;
 
-  pid = waitpid(-1, &status, WNOHANG);
-  if(pid < 1)
+  pid = waitpid(wpid, &status, WNOHANG);
+  if(pid < 0 && ERRNO_AGAIN(errno))
     return -EAGAIN;
+  if(pid < 0)
+    return -errno;
+  if(pid < 1) {
+    if (wpid > 0 && pid != wpid)
+      return -EAGAIN;
+    return 0;
+  }
 
   pthread_mutex_lock(&spawn_mutex);
   LIST_FOREACH(s, &spawns, link)
@@ -279,7 +286,15 @@ spawn_reap(char *stxt, size_t stxtlen)
 static void
 spawn_reaper(void)
 {
-  while (spawn_reap(NULL, 0) != -EAGAIN) ;
+  int r;
+
+  do {
+    r = spawn_reap(-1, NULL, 0);
+    if (r == -EAGAIN)
+      continue;
+    if (r <= 0)
+      break;
+  } while (1);
 }
 
 /**
@@ -299,7 +314,8 @@ spawn_kill(pid_t pid, int sig)
       if(s->pid == pid)
         break;
     if (s) {
-      r = kill(pid, sig);
+      /* kill the whole process group */
+      r = kill(-pid, sig);
       if (r < 0)
         r = -errno;
     }
@@ -409,7 +425,16 @@ spawn_and_give_stdout(const char *prog, char *argv[], char *envp[],
   }
 
   if (!argv) argv = (void *)local_argv;
-  if (!argv[0]) argv[0] = (char*)prog;
+  if (!argv[0]) {
+    if (argv != (void *)local_argv) {
+      for (i = 1, e = argv + 1; *e; i++, e++);
+      i = (i + 1) * sizeof(char *);
+      e = alloca(i);
+      memcpy(e, argv, i);
+      argv = e;
+    }
+    argv[0] = (char *)prog;
+  }
 
   if (!envp || !envp[0]) {
     e = environ;
@@ -493,8 +518,14 @@ spawn_and_give_stdout(const char *prog, char *argv[], char *envp[],
   close(fd[1]);
 
   *rd = fd[0];
-  if (pid)
+  if (pid) {
     *pid = p;
+
+    // make the spawned process a session leader so killing the
+    // process group recursively kills any child process that
+    // might have been spawned
+    setpgid(p, p);
+  }
   return 0;
 }
 

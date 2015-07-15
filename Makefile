@@ -57,12 +57,25 @@ endif
 
 ifeq ($(CONFIG_LIBFFMPEG_STATIC),yes)
 CFLAGS  += -I${ROOTDIR}/libav_static/build/ffmpeg/include
-LDFLAGS += -L${ROOTDIR}/libav_static/build/ffmpeg/lib -Wl,-Bstatic \
-           -lavresample -lswresample -lswscale \
-           -lavutil -lavformat -lavcodec -lavutil \
-           -lvorbisenc -lvorbis -logg -lx264 -lvpx \
-           -Wl,-Bdynamic
+LDFLAGS_FFDIR = ${ROOTDIR}/libav_static/build/ffmpeg/lib
+LDFLAGS += ${LDFLAGS_FFDIR}/libavresample.a
+LDFLAGS += ${LDFLAGS_FFDIR}/libswresample.a
+LDFLAGS += ${LDFLAGS_FFDIR}/libswscale.a
+LDFLAGS += ${LDFLAGS_FFDIR}/libavutil.a
+LDFLAGS += ${LDFLAGS_FFDIR}/libavformat.a
+LDFLAGS += ${LDFLAGS_FFDIR}/libavcodec.a
+LDFLAGS += ${LDFLAGS_FFDIR}/libavutil.a
+LDFLAGS += ${LDFLAGS_FFDIR}/libvorbisenc.a
+LDFLAGS += ${LDFLAGS_FFDIR}/libvorbis.a
+LDFLAGS += ${LDFLAGS_FFDIR}/libogg.a
+ifeq ($(CONFIG_LIBFFMPEG_STATIC_X264),yes)
+LDFLAGS += ${LDFLAGS_FFDIR}/libx264.a
+else
+LDFLAGS += -lx264
 endif
+LDFLAGS += ${LDFLAGS_FFDIR}/libvpx.a
+endif
+
 ifeq ($(CONFIG_HDHOMERUN_STATIC),yes)
 CFLAGS  += -I${ROOTDIR}/libhdhomerun_static
 LDFLAGS += -L${ROOTDIR}/libhdhomerun_static/libhdhomerun \
@@ -159,6 +172,12 @@ SRCS =  src/version.c \
 SRCS-${CONFIG_UPNP} += \
 	src/upnp.c
 
+# SATIP Server
+SRCS-${CONFIG_SATIP_SERVER} += \
+	src/satip/server.c \
+	src/satip/rtsp.c \
+	src/satip/rtp.c
+
 SRCS += \
 	src/api.c \
 	src/api/api_status.c \
@@ -219,12 +238,15 @@ SRCS += src/muxer.c \
 # Optional code
 #
 
-# MPEGTS core
+# MPEGTS core, order by usage (psi lib, tsdemux)
 SRCS-$(CONFIG_MPEGTS) += \
 	src/descrambler/descrambler.c \
 	src/descrambler/caclient.c \
 	src/input/mpegts.c \
+	src/input/mpegts/mpegts_pid.c \
 	src/input/mpegts/mpegts_input.c \
+	src/input/mpegts/tsdemux.c \
+	src/input/mpegts/dvb_psi_lib.c \
 	src/input/mpegts/mpegts_network.c \
 	src/input/mpegts/mpegts_mux.c \
 	src/input/mpegts/mpegts_service.c \
@@ -233,9 +255,8 @@ SRCS-$(CONFIG_MPEGTS) += \
 	src/input/mpegts/dvb_charset.c \
 	src/input/mpegts/dvb_psi.c \
 	src/input/mpegts/fastscan.c \
-	src/input/mpegts/tsdemux.c \
 	src/input/mpegts/mpegts_mux_sched.c \
-  src/input/mpegts/mpegts_network_scan.c \
+        src/input/mpegts/mpegts_network_scan.c
 
 # MPEGTS DVB
 SRCS-${CONFIG_MPEGTS_DVB} += \
@@ -262,7 +283,7 @@ SRCS-${CONFIG_LINUXDVB} += \
         src/input/mpegts/linuxdvb/linuxdvb_rotor.c \
         src/input/mpegts/linuxdvb/linuxdvb_en50494.c
 
-# SATIP
+# SATIP Client
 SRCS-${CONFIG_SATIP_CLIENT} += \
 	src/input/mpegts/satip/satip.c \
 	src/input/mpegts/satip/satip_frontend.c \
@@ -282,6 +303,7 @@ SRCS-${CONFIG_IPTV} += \
         src/input/mpegts/iptv/iptv_service.c \
         src/input/mpegts/iptv/iptv_http.c \
         src/input/mpegts/iptv/iptv_udp.c \
+        src/input/mpegts/iptv/iptv_rtsp.c \
         src/input/mpegts/iptv/iptv_pipe.c
 
 # TSfile
@@ -329,6 +351,11 @@ SRCS-${CONFIG_CAPMT} += \
 # CONSTCW
 SRCS-${CONFIG_CONSTCW} += \
 	src/descrambler/constcw.c
+
+# DVB CAM
+SRCS-${CONFIG_LINUXDVB_CA} += \
+	src/input/mpegts/linuxdvb/linuxdvb_ca.c \
+	src/descrambler/dvbcam.c
 
 # TSDEBUGCW
 SRCS-${CONFIG_TSDEBUG} += \
@@ -407,7 +434,7 @@ reconfigure:
 	$(ROOTDIR)/configure $(CONFIGURE_ARGS)
 
 # Binary
-${PROG}: check_config $(OBJS) $(ALLDEPS)
+${PROG}: check_config make_webui $(OBJS) $(ALLDEPS)
 	$(CC) -o $@ $(OBJS) $(CFLAGS) $(LDFLAGS)
 
 # Object
@@ -424,11 +451,13 @@ ${BUILDDIR}/%.so: ${SRCS_EXTRA}
 clean:
 	rm -rf ${BUILDDIR}/src ${BUILDDIR}/bundle*
 	find . -name "*~" | xargs rm -f
+	$(MAKE) -f Makefile.webui clean
 
 distclean: clean
 	rm -rf ${ROOTDIR}/libav_static
 	rm -rf ${ROOTDIR}/libhdhomerun_static
 	rm -rf ${ROOTDIR}/build.*
+	rm -rf ${ROOTDIR}/data/dvb-scan
 	rm -f ${ROOTDIR}/.config.mk
 
 # Create version
@@ -440,6 +469,9 @@ FORCE:
 # Include dependency files if they exist.
 -include $(DEPS)
 
+# Some hardcoded deps
+src/webui/extjs.c: make_webui
+
 # Include OS specific targets
 include ${ROOTDIR}/support/${OSENV}.mk
 
@@ -448,9 +480,13 @@ $(BUILDDIR)/bundle.o: $(BUILDDIR)/bundle.c
 	@mkdir -p $(dir $@)
 	$(CC) -I${ROOTDIR}/src -c -o $@ $<
 
-$(BUILDDIR)/bundle.c: check_dvb_scan
+$(BUILDDIR)/bundle.c: check_dvb_scan make_webui
 	@mkdir -p $(dir $@)
 	$(MKBUNDLE) -o $@ -d ${BUILDDIR}/bundle.d $(BUNDLE_FLAGS) $(BUNDLES:%=$(ROOTDIR)/%)
+
+.PHONY: make_webui
+make_webui:
+	$(MAKE) -f Makefile.webui all
 
 # Static FFMPEG
 
@@ -462,8 +498,9 @@ endif
 ${BUILDDIR}/libffmpeg_stamp: ${ROOTDIR}/libav_static/build/ffmpeg/lib/libavcodec.a
 	@touch $@
 
-${ROOTDIR}/libav_static/build/ffmpeg/lib/libavcodec.a:
-	$(MAKE) -f Makefile.ffmpeg build
+${ROOTDIR}/libav_static/build/ffmpeg/lib/libavcodec.a: Makefile.ffmpeg
+	CONFIG_LIBFFMPEG_STATIC_X264=$(CONFIG_LIBFFMPEG_STATIC_X264) \
+	  $(MAKE) -f Makefile.ffmpeg build
 
 # Static HDHOMERUN library
 
@@ -475,7 +512,7 @@ endif
 ${BUILDDIR}/libhdhomerun_stamp: ${ROOTDIR}/libhdhomerun_static/libhdhomerun/libhdhomerun.a
 	@touch $@
 
-${ROOTDIR}/libhdhomerun_static/libhdhomerun/libhdhomerun.a:
+${ROOTDIR}/libhdhomerun_static/libhdhomerun/libhdhomerun.a: Makefile.hdhomerun
 	$(MAKE) -f Makefile.hdhomerun build
 
 # linuxdvb git tree

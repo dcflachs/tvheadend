@@ -27,8 +27,8 @@
 static void
 mpegts_network_scan_notify ( mpegts_mux_t *mm )
 {
-  idnode_notify_simple(&mm->mm_id);
-  idnode_notify_simple(&mm->mm_network->mn_id);
+  idnode_notify_changed(&mm->mm_id);
+  idnode_notify_changed(&mm->mm_network->mn_id);
 }
 
 static int
@@ -47,13 +47,16 @@ mpegts_network_scan_timer_cb ( void *p )
   /* Process Q */
   for (mm = TAILQ_FIRST(&mn->mn_scan_pend); mm != NULL; mm = nxt) {
     nxt = TAILQ_NEXT(mm, mm_scan_link);
-    assert(mm->mm_scan_state == MM_SCAN_STATE_PEND);
+    assert(mm->mm_scan_state == MM_SCAN_STATE_PEND || mm->mm_scan_state == MM_SCAN_STATE_ACTIVE);
 
     /* Don't try to subscribe already tuned muxes */
     if (mm->mm_active) continue;
 
     /* Attempt to tune */
-    r = mpegts_mux_subscribe(mm, "scan", mm->mm_scan_weight, mm->mm_scan_flags);
+    r = mpegts_mux_subscribe(mm, NULL, "scan", mm->mm_scan_weight,
+                             mm->mm_scan_flags |
+                             SUBSCRIPTION_ONESHOT |
+                             SUBSCRIPTION_TABLES);
 
     /* Started */
     if (!r) {
@@ -69,7 +72,7 @@ mpegts_network_scan_timer_cb ( void *p )
     /* No valid tuners (subtly different, might be able to tuner a later
      * mux)
      */
-    if (r == SM_CODE_NO_VALID_ADAPTER)
+    if (r == SM_CODE_NO_VALID_ADAPTER && mm->mm_is_enabled(mm))
       continue;
 
     /* Failed */
@@ -289,7 +292,7 @@ mpegts_mux_bouquet_rescan ( const char *src, const char *extra )
       LIST_FOREACH(mm, &mn->mn_muxes, mm_network_link)
         if (idnode_is_instance(&mm->mm_id, &dvb_mux_dvbs_class) &&
             mm->mm_tsid == tsid &&
-            dvb_sat_position(&((dvb_mux_t *)mm)->lm_tuning) == satpos)
+            ((dvb_mux_t *)mm)->lm_tuning.u.dmc_fe_qpsk.orbital_pos == satpos)
           mpegts_mux_scan_state_set(mm, MM_SCAN_STATE_PEND);
     return;
   }
@@ -321,24 +324,83 @@ tsid_lookup:
     if (!extra)
       return;
     freq = strtod(extra, NULL) * 1000;
-    goto freq;
+
+    LIST_FOREACH(mn, &mpegts_network_all, mn_global_link)
+      LIST_FOREACH(mm, &mn->mn_muxes, mm_network_link)
+        if (idnode_is_instance(&mm->mm_id, &dvb_mux_dvbs_class) &&
+            deltaU32(((dvb_mux_t *)mm)->lm_tuning.dmc_fe_freq, freq) < 2000 &&
+            ((dvb_mux_t *)mm)->lm_tuning.u.dmc_fe_qpsk.orbital_pos == satpos)
+          mpegts_mux_scan_state_set(mm, MM_SCAN_STATE_PEND);
+    return;
   }
-  if ((l = startswith(src, "dvb-fastscan://dvbs,")) > 0) {
-    uint32_t pid;
+  if ((l = startswith(src, "dvb-fastscan://")) > 0) {
+    uint32_t pid, symbol, dvbs2;
+    char pol[2];
+    pol[1] = '\0';
     src += l;
+
+    if ((l = startswith(src, "DVBS2,")) > 0)
+      dvbs2 = 1;
+    else if ((l = startswith(src, "DVBS,")) > 0)
+      dvbs2 = 0;
+    else
+      return;
+    src += l;
+
     if ((satpos = dvb_sat_position_from_str(src)) == INT_MAX)
       return;
     while (*src && *src != ',')
       src++;
-    if (sscanf(src, ",%u,%u", &freq, &pid) != 2)
+    if (sscanf(src, ",%u,%c,%u,%u", &freq, &pol[0], &symbol, &pid) != 4)
       return;
-freq:
+
+    // search for fastscan mux
     LIST_FOREACH(mn, &mpegts_network_all, mn_global_link)
       LIST_FOREACH(mm, &mn->mn_muxes, mm_network_link)
         if (idnode_is_instance(&mm->mm_id, &dvb_mux_dvbs_class) &&
-            abs(((dvb_mux_t *)mm)->lm_tuning.dmc_fe_freq - freq) < 2000 &&
-            dvb_sat_position(&((dvb_mux_t *)mm)->lm_tuning) == satpos)
+            deltaU32(((dvb_mux_t *)mm)->lm_tuning.dmc_fe_freq, freq) < 2000 &&
+            ((dvb_mux_t *)mm)->lm_tuning.u.dmc_fe_qpsk.polarisation == dvb_str2pol(pol) &&
+            ((dvb_mux_t *)mm)->lm_tuning.u.dmc_fe_qpsk.orbital_pos == satpos)
+        {
+          char buf[256];
+          mpegts_mux_nice_name(mm, buf, sizeof(buf));
+          tvhinfo("mpegts", "fastscan mux found '%s', set scan state 'PENDING'", buf);
           mpegts_mux_scan_state_set(mm, MM_SCAN_STATE_PEND);
+          return;
+        }
+    tvhinfo("mpegts", "fastscan mux not found, position:%i, frequency:%i, polarisation:%c", satpos, freq, pol[0]);
+
+    // fastscan mux not found, try to add it automatically
+    LIST_FOREACH(mn, &mpegts_network_all, mn_global_link)
+      if (mn->mn_satpos != INT_MAX && mn->mn_satpos == satpos)
+      {
+        dvb_mux_conf_t *mux;
+        mpegts_mux_t *mm = NULL;
+
+        mux = malloc(sizeof(dvb_mux_conf_t));
+        dvb_mux_conf_init(mux, dvbs2 ? DVB_SYS_DVBS2 : DVB_SYS_DVBS);
+        mux->dmc_fe_freq = freq;
+        mux->u.dmc_fe_qpsk.symbol_rate = symbol;
+        mux->u.dmc_fe_qpsk.polarisation = dvb_str2pol(pol);
+        mux->u.dmc_fe_qpsk.orbital_pos = satpos;
+        mux->u.dmc_fe_qpsk.fec_inner = DVB_FEC_AUTO;
+        mux->dmc_fe_modulation = dvbs2 ? DVB_MOD_PSK_8 : DVB_MOD_QPSK;
+        mux->dmc_fe_rolloff = DVB_ROLLOFF_AUTO;
+        mux->dmc_fe_pls_code = 1;
+
+        mm = (mpegts_mux_t*)dvb_mux_create0((dvb_network_t*)mn,
+                                            MPEGTS_ONID_NONE,
+                                            MPEGTS_TSID_NONE,
+                                            mux, NULL, NULL);
+        if (mm)
+        {
+          mm->mm_config_save(mm);
+          char buf[256];
+          mn->mn_display_name(mn, buf, sizeof(buf));
+          tvhinfo("mpegts", "fastscan mux add to network '%s'", buf);
+        }
+        free(mux);
+      }
     return;
   }
 #endif

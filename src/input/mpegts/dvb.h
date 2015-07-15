@@ -1,6 +1,6 @@
 /*
  *  Tvheadend - DVB support routines and defines
- *  Copyright (C) 2007 Andreas Öman
+ *  Copyright (C) 2007 Andreas Ã–man
  *
  *  This program is free software: you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -34,9 +34,19 @@ struct mpegts_mux;
 
 #define DVB_PAT_PID                   0x00
 #define DVB_CAT_PID                   0x01
+#define DVB_TSDT_PID                  0x02
 #define DVB_NIT_PID                   0x10
 #define DVB_SDT_PID                   0x11
 #define DVB_BAT_PID                   0x11
+#define DVB_EIT_PID                   0x12
+#define DVB_RST_PID                   0x13
+#define DVB_TDT_PID                   0x14
+#define DVB_SNC_PID                   0x15
+#define DVB_RNT_PID                   0x16
+#define DVB_INB_PID                   0x1C
+#define DVB_MSR_PID                   0x1D
+#define DVB_DIT_PID                   0x1E
+#define DVB_SIT_PID                   0x1F
 #define DVB_VCT_PID                   0x1FFB
 #define DVB_ATSC_STT_PID              0x1FFB
 #define DVB_ATSC_MGT_PID              0x1FFB
@@ -60,6 +70,12 @@ struct mpegts_mux;
 
 #define DVB_BAT_BASE                  0x48
 #define DVB_BAT_MASK                  0xF8
+
+#define DVB_TDT_BASE                  0x70
+#define DVB_TDT_MASK                  0xFF
+
+#define DVB_TOT_BASE                  0x73
+#define DVB_TOT_MASK                  0xFF
 
 #define DVB_FASTSCAN_NIT_BASE         0xBC
 #define DVB_FASTSCAN_SDT_BASE         0xBD
@@ -196,8 +212,13 @@ int atsc_get_string
 
 #define bcdtoint(i) ((((i & 0xf0) >> 4) * 10) + (i & 0x0f))
 
+<<<<<<< HEAD
 time_t dvb_convert_date(const uint8_t *dvb_buf);
 time_t atsc_convert_gpstime(uint32_t gpstime);
+=======
+time_t dvb_convert_date(const uint8_t *dvb_buf, int local);
+
+>>>>>>> remotes/Upstream/release/4.0
 void atsc_utf16_to_utf8(const uint8_t *src, int len, char *buf, int buflen);
 
 /*
@@ -233,13 +254,73 @@ do {\
   DVB_LOOP_INIT(ptr, len, off, lptr, llen);\
   DVB_DESC_EACH(lptr, llen, dtag, dlen, dptr)\
 
-/* PSI table callbacks */
+/*
+ * SI typedefs
+ */
+
+#define MPEGTS_PSI_SECTION_SIZE 5000
+
+typedef struct mpegts_psi_section
+{
+  int8_t  ps_cc;
+  int8_t  ps_cco;
+  int     ps_offset;
+  int     ps_lock;
+  uint8_t ps_data[MPEGTS_PSI_SECTION_SIZE];
+} mpegts_psi_section_t;
+
+typedef void (*mpegts_psi_section_callback_t)
+  ( const uint8_t *tsb, size_t len, void *opaque );
+
+typedef struct mpegts_psi_table_state
+{
+  int      tableid;
+  uint64_t extraid;
+  int      version;
+  int      complete;
+  int      working;
+  uint32_t sections[8];
+  RB_ENTRY(mpegts_psi_table_state) link;
+} mpegts_psi_table_state_t;
+
+typedef struct mpegts_psi_table
+{
+  LIST_ENTRY(mpegts_table) mt_link;
+  RB_HEAD(,mpegts_psi_table_state) mt_state;
+
+  char   *mt_name;
+  void   *mt_opaque;
+
+  uint8_t mt_table; // SI table id (base)
+  uint8_t mt_mask;  //              mask
+
+  int     mt_pid;
+
+  int     mt_complete;
+  int     mt_incomplete;
+  uint8_t mt_finished;
+
+  mpegts_psi_section_t mt_sect;
+
+  tvhlog_limit_t mt_err_log;
+
+} mpegts_psi_table_t;
+
+/*
+ * Assemble SI section
+ */
+void mpegts_psi_section_reassemble
+ ( mpegts_psi_table_t *mt, const uint8_t *tsb, int crc,
+   mpegts_psi_section_callback_t cb, void *opaque );
+
+/* PSI table parser helpers */
 
 int dvb_table_end
-  (struct mpegts_table *mt, struct mpegts_table_state *st, int sect );
+  (mpegts_psi_table_t *mt, mpegts_psi_table_state_t *st, int sect );
 int dvb_table_begin
-  (struct mpegts_table *mt, const uint8_t *ptr, int len,
+  (mpegts_psi_table_t *mt, const uint8_t *ptr, int len,
    int tableid, uint64_t extraid, int minlen,
+<<<<<<< HEAD
    struct mpegts_table_state **st, int *sect, int *last, int *ver);
 void dvb_table_reset
   (struct mpegts_table *mt);
@@ -271,20 +352,34 @@ void psi_tables_default ( struct mpegts_mux *mm );
 void psi_tables_dvb     ( struct mpegts_mux *mm );
 void psi_tables_atsc_t  ( struct mpegts_mux *mm );
 void psi_tables_atsc_c  ( struct mpegts_mux *mm );
+=======
+   mpegts_psi_table_state_t **st, int *sect, int *last, int *ver);
+void dvb_table_reset (mpegts_psi_table_t *mt);
+void dvb_table_release (mpegts_psi_table_t *mt);
+>>>>>>> remotes/Upstream/release/4.0
 
-/*
- *
- */
-#if ENABLE_MPEGTS_DVB
+/* all-in-one parser */
 
-typedef enum dvb_fe_type {
-  DVB_TYPE_NONE = 0,
-  DVB_TYPE_T = 1,		/* terrestrial */
-  DVB_TYPE_C,			/* cable */
-  DVB_TYPE_S,			/* satellite */
-  DVB_TYPE_ATSC,		/* terrestrial - north america */
-  DVB_TYPE_LAST = DVB_TYPE_ATSC
-} dvb_fe_type_t;
+typedef void (*mpegts_psi_parse_callback_t)
+  ( mpegts_psi_table_t *, const uint8_t *buf, int len );
+
+void dvb_table_parse_init
+  ( mpegts_psi_table_t *mt, const char *name, int pid, void *opaque );
+
+void dvb_table_parse_done ( mpegts_psi_table_t *mt);
+
+void dvb_table_parse
+  (mpegts_psi_table_t *mt, const uint8_t *tsb, int len,
+   int crc, int full, mpegts_psi_parse_callback_t cb);
+
+int dvb_table_append_crc32(uint8_t *dst, int off, int maxlen);
+
+int dvb_table_remux
+  (mpegts_psi_table_t *mt, const uint8_t *buf, int len, uint8_t **out);
+
+extern htsmsg_t *satellites;
+
+/* Delivery systems */
 
 typedef enum dvb_fe_delivery_system {
   DVB_SYS_NONE            =    0,
@@ -306,7 +401,24 @@ typedef enum dvb_fe_delivery_system {
   DVB_SYS_CMMB            =  900,
   DVB_SYS_DAB             = 1000,
   DVB_SYS_TURBO           = 1100,
+  /* TVH internal */
+  DVB_SYS_ATSC_ALL        = 9998,
+  DVB_SYS_UNKNOWN         = 9999
 } dvb_fe_delivery_system_t;
+
+/*
+ *
+ */
+#if ENABLE_MPEGTS_DVB
+
+typedef enum dvb_fe_type {
+  DVB_TYPE_NONE = 0,
+  DVB_TYPE_T = 1,		/* terrestrial */
+  DVB_TYPE_C,			/* cable */
+  DVB_TYPE_S,			/* satellite */
+  DVB_TYPE_ATSC,		/* terrestrial - north america */
+  DVB_TYPE_LAST = DVB_TYPE_ATSC
+} dvb_fe_type_t;
 
 typedef enum dvb_fe_spectral_inversion {
   DVB_INVERSION_UNDEFINED,
@@ -446,6 +558,12 @@ typedef enum dvb_fe_rolloff {
   DVB_ROLLOFF_35         = 350,
 } dvb_fe_rolloff_t;
 
+typedef enum dvb_fe_pls_mode {
+  DVB_PLS_ROOT = 0,
+  DVB_PLS_GOLD,
+  DVB_PLS_COMBO,
+} dvb_fe_pls_mode_t;
+
 typedef enum dvb_polarisation {
   DVB_POLARISATION_HORIZONTAL     = 0x00,
   DVB_POLARISATION_VERTICAL       = 0x01,
@@ -454,10 +572,11 @@ typedef enum dvb_polarisation {
   DVB_POLARISATION_OFF            = 0x04
 } dvb_polarisation_t;
 
+#define DVB_NO_STREAM_ID_FILTER (-1)
+
 typedef struct dvb_qpsk_config {
   dvb_polarisation_t  polarisation;
   int                 orbital_pos;
-  char                orbital_dir;
   uint32_t            symbol_rate;
   dvb_fe_code_rate_t  fec_inner;
 } dvb_qpsk_config_t;
@@ -485,6 +604,9 @@ typedef struct dvb_mux_conf
   dvb_fe_spectral_inversion_t dmc_fe_inversion;
   dvb_fe_rolloff_t            dmc_fe_rolloff;
   dvb_fe_pilot_t              dmc_fe_pilot;
+  int32_t                     dmc_fe_stream_id;
+  dvb_fe_pls_mode_t           dmc_fe_pls_mode;
+  uint32_t                    dmc_fe_pls_code;
   union {
     dvb_qpsk_config_t         dmc_fe_qpsk;
     dvb_qam_config_t          dmc_fe_qam;
@@ -509,6 +631,7 @@ const char *dvb_hier2str    ( int hier );
 const char *dvb_pol2str     ( int pol );
 const char *dvb_type2str    ( int type );
 const char *dvb_pilot2str   ( int pilot );
+const char *dvb_plsmode2str   ( int pls_mode );
 #define dvb_feclo2str dvb_fec2str
 #define dvb_fechi2str dvb_fec2str
 
@@ -524,6 +647,7 @@ int dvb_str2hier    ( const char *str );
 int dvb_str2pol     ( const char *str );
 int dvb_str2type    ( const char *str );
 int dvb_str2pilot   ( const char *str );
+int dvb_str2plsmode ( const char *str );
 #define dvb_str2feclo dvb_str2fec
 #define dvb_str2fechi dvb_str2fec
 
@@ -534,9 +658,9 @@ static inline int dvb_bandwidth( dvb_fe_bandwidth_t bw )
 
 int dvb_delsys2type ( enum dvb_fe_delivery_system ds );
 
-int dvb_mux_conf_str ( dvb_mux_conf_t *conf, char *buf, size_t bufsize );
+void dvb_mux_conf_init ( dvb_mux_conf_t *dmc, dvb_fe_delivery_system_t delsys );
 
-int dvb_sat_position( const dvb_mux_conf_t *mc );
+int dvb_mux_conf_str ( dvb_mux_conf_t *conf, char *buf, size_t bufsize );
 
 const char *dvb_sat_position_to_str( int position, char *buf, size_t buflen );
 

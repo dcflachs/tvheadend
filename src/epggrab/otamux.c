@@ -54,6 +54,7 @@ epggrab_ota_head_t           epggrab_ota_active;
 gtimer_t                     epggrab_ota_kick_timer;
 gtimer_t                     epggrab_ota_start_timer;
 
+int                          epggrab_ota_running;
 int                          epggrab_ota_pending_flag;
 
 pthread_mutex_t              epggrab_ota_mutex;
@@ -295,15 +296,18 @@ epggrab_mux_start ( mpegts_mux_t *mm, void *p )
 }
 
 static void
-epggrab_mux_stop ( mpegts_mux_t *mm, void *p )
+epggrab_mux_stop ( mpegts_mux_t *mm, void *p, int reason )
 {
   epggrab_ota_mux_t *ota;
   const char *uuid = idnode_uuid_as_str(&mm->mm_id);
+  int done = EPGGRAB_OTA_DONE_STOLEN;
 
+  if (reason == SM_CODE_NO_INPUT)
+    done = EPGGRAB_OTA_DONE_NO_DATA;
   tvhtrace("epggrab", "mux %p (%s) stop", mm, uuid);
   TAILQ_FOREACH(ota, &epggrab_ota_active, om_q_link)
     if (!strcmp(ota->om_mux_uuid, uuid)) {
-      epggrab_ota_done(ota, EPGGRAB_OTA_DONE_STOLEN);
+      epggrab_ota_done(ota, done);
       break;
     }
 }
@@ -318,6 +322,9 @@ epggrab_ota_register
 {
   int save = 0;
   epggrab_ota_map_t *map;
+
+  if (!epggrab_ota_running)
+    return NULL;
 
   if (ota == NULL) {
     /* Find mux entry */
@@ -505,10 +512,13 @@ next_one:
     net->failed = 0;
   }
 
-  epg_flag = mm->mm_is_epg(mm);
-  if (epg_flag > MM_EPG_LAST)
-    epg_flag = MM_EPG_ENABLE;
-  modname  = epg_flag >= 0 ? modnames[epg_flag] : NULL;
+  epg_flag = MM_EPG_DISABLE;
+  if (mm->mm_is_enabled(mm)) {
+    epg_flag = mm->mm_is_epg(mm);
+    if (epg_flag > MM_EPG_LAST)
+      epg_flag = MM_EPG_ENABLE;
+    modname  = epg_flag >= 0 ? modnames[epg_flag] : NULL;
+  }
 
   if (epg_flag < 0 || epg_flag == MM_EPG_DISABLE) {
 #if ENABLE_TRACE
@@ -541,8 +551,11 @@ next_one:
 
   /* Subscribe to the mux */
   om->om_requeue = 1;
-  if ((r = mpegts_mux_subscribe(mm, "epggrab", SUBSCRIPTION_PRIO_EPG,
-                                SUBSCRIPTION_EPG))) {
+  if ((r = mpegts_mux_subscribe(mm, NULL, "epggrab",
+                                SUBSCRIPTION_PRIO_EPG,
+                                SUBSCRIPTION_EPG |
+                                SUBSCRIPTION_ONESHOT |
+                                SUBSCRIPTION_TABLES))) {
     TAILQ_INSERT_TAIL(&epggrab_ota_pending, om, om_q_link);
     om->om_q_type = EPGGRAB_OTA_MUX_PENDING;
     if (r == SM_CODE_NO_FREE_ADAPTER)
@@ -654,7 +667,7 @@ epggrab_ota_service_add ( epggrab_ota_map_t *map, epggrab_ota_mux_t *ota,
 {
   epggrab_ota_svc_link_t *svcl;
 
-  if (uuid == NULL)
+  if (uuid == NULL || !epggrab_ota_running)
     return;
   SKEL_ALLOC(epggrab_svc_link_skel);
   epggrab_svc_link_skel->uuid = (char *)uuid;
@@ -674,7 +687,7 @@ void
 epggrab_ota_service_del ( epggrab_ota_map_t *map, epggrab_ota_mux_t *ota,
                           epggrab_ota_svc_link_t *svcl, int save )
 {
-  if (svcl == NULL)
+  if (svcl == NULL || (!epggrab_ota_running && save))
     return;
   epggrab_ota_service_trace(ota, svcl, "delete");
   RB_REMOVE(&map->om_svcs, svcl, link);
@@ -799,6 +812,8 @@ epggrab_ota_init ( void )
   if (!lstat(path, &st))
     if (!S_ISDIR(st.st_mode))
       hts_settings_remove("epggrab/otamux");
+
+  epggrab_ota_running = 1;
   
   /* Load config */
   if ((c = hts_settings_load_r(1, "epggrab/otamux"))) {
@@ -811,16 +826,23 @@ epggrab_ota_init ( void )
 }
 
 void
+epggrab_ota_trigger ( int secs )
+{
+  /* notify another system layers, that we will do EPG OTA */
+  secs = MIN(1, MAX(secs, 7*24*3600));
+  dbus_emit_signal_s64("/epggrab/ota", "next", time(NULL) + secs);
+  epggrab_ota_pending_flag = 1;
+  epggrab_ota_kick(secs);
+}
+
+void
 epggrab_ota_post ( void )
 {
   time_t t = (time_t)-1;
 
   /* Init timer (call after full init - wait for network tuners) */
   if (epggrab_ota_initial) {
-    /* notify another system layers, that we will do EPG OTA */
-    dbus_emit_signal_s64("/epggrab/ota", "next", time(NULL) + 15);
-    epggrab_ota_pending_flag = 1;
-    epggrab_ota_kick(15);
+    epggrab_ota_trigger(15);
     t = time(NULL);
   }
 
@@ -856,6 +878,7 @@ epggrab_ota_shutdown ( void )
   epggrab_ota_mux_t *ota;
 
   pthread_mutex_lock(&global_lock);
+  epggrab_ota_running = 0;
   while ((ota = TAILQ_FIRST(&epggrab_ota_active)) != NULL)
     epggrab_ota_free(&epggrab_ota_active, ota);
   while ((ota = TAILQ_FIRST(&epggrab_ota_pending)) != NULL)

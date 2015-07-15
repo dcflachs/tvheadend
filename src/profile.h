@@ -23,6 +23,20 @@
 #include "idnode.h"
 #include "muxer.h"
 
+typedef enum {
+  PROFILE_SPRIO_NOTSET = 0,
+  PROFILE_SPRIO_IMPORTANT,
+  PROFILE_SPRIO_HIGH,
+  PROFILE_SPRIO_NORMAL,
+  PROFILE_SPRIO_LOW,
+  PROFILE_SPRIO_UNIMPORTANT,
+  PROFILE_SPRIO_DVR_IMPORTANT,
+  PROFILE_SPRIO_DVR_HIGH,
+  PROFILE_SPRIO_DVR_NORMAL,
+  PROFILE_SPRIO_DVR_LOW,
+  PROFILE_SPRIO_DVR_UNIMPORTANT
+} profile_sprio_t;
+
 struct profile;
 struct muxer;
 struct streaming_target;
@@ -74,6 +88,7 @@ typedef struct profile_chain {
   int                       prch_flags;
   int                       prch_stop;
   int                       prch_start_pending;
+  int                       prch_sq_used;
   struct streaming_queue    prch_sq;
   struct streaming_target  *prch_post_share;
   struct streaming_target  *prch_st;
@@ -103,8 +118,11 @@ typedef struct profile {
   int pro_shield;
   char *pro_name;
   char *pro_comment;
+  int pro_prio;
+  int pro_fprio;
   int pro_timeout;
   int pro_restart;
+  int pro_contaccess;
 
   void (*pro_free)(struct profile *pro);
   void (*pro_conf_changed)(struct profile *pro);
@@ -143,8 +161,9 @@ int
 profile_chain_open(profile_chain_t *prch,
                    muxer_config_t *m_cfg, int flags, size_t qsize);
 void profile_chain_init(profile_chain_t *prch, profile_t *pro, void *id);
-int  profile_chain_raw_open(profile_chain_t *prch, void *id, size_t qsize);
+int  profile_chain_raw_open(profile_chain_t *prch, void *id, size_t qsize, int muxer);
 void profile_chain_close(profile_chain_t *prch);
+int  profile_chain_weight(profile_chain_t *prch, int custom);
 
 static inline profile_t *profile_find_by_uuid(const char *uuid)
   {  return (profile_t*)idnode_find(uuid, &profile_class, NULL); }

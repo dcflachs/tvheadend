@@ -34,8 +34,10 @@
 #include <openssl/sha.h>
 
 #include <linux/dvb/frontend.h>
+#include <linux/dvb/ca.h>
 
 #define FE_PATH  "%s/frontend%d"
+#define CA_PATH  "%s/ca%d"
 #define DVR_PATH "%s/dvr%d"
 #define DMX_PATH "%s/demux%d"
 
@@ -54,10 +56,17 @@ static idnode_set_t *
 linuxdvb_adapter_class_get_childs ( idnode_t *in )
 {
   linuxdvb_frontend_t *lfe;
+#if ENABLE_LINUXDVB_CA
+  linuxdvb_ca_t *lca;
+#endif
   linuxdvb_adapter_t *la = (linuxdvb_adapter_t*)in;
   idnode_set_t *is = idnode_set_create(0);
   LIST_FOREACH(lfe, &la->la_frontends, lfe_link)
     idnode_set_add(is, &lfe->ti_id, NULL);
+#if ENABLE_LINUXDVB_CA
+  LIST_FOREACH(lca, &la->la_ca_devices, lca_link)
+    idnode_set_add(is, &lca->lca_id, NULL);
+#endif
   return is;
 }
 
@@ -96,6 +105,9 @@ linuxdvb_adapter_save ( linuxdvb_adapter_t *la )
 {
   htsmsg_t *m, *l;
   linuxdvb_frontend_t *lfe;
+#if ENABLE_LINUXDVB_CA
+  linuxdvb_ca_t *lca;
+#endif
 
   m = htsmsg_create_map();
   idnode_save(&la->th_id, m);
@@ -105,6 +117,14 @@ linuxdvb_adapter_save ( linuxdvb_adapter_t *la )
   LIST_FOREACH(lfe, &la->la_frontends, lfe_link)
     linuxdvb_frontend_save(lfe, l);
   htsmsg_add_msg(m, "frontends", l);
+
+  /* CAs */
+#if ENABLE_LINUXDVB_CA
+  l = htsmsg_create_map();
+  LIST_FOREACH(lca, &la->la_ca_devices, lca_link)
+    linuxdvb_ca_save(lca, l);
+  htsmsg_add_msg(m, "ca_devices", l);
+#endif
 
   /* Save */
   hts_settings_save(m, "input/linuxdvb/adapters/%s",
@@ -132,7 +152,7 @@ linuxdvb_adapter_is_enabled ( linuxdvb_adapter_t *la )
 static linuxdvb_adapter_t *
 linuxdvb_adapter_create
   ( const char *uuid, htsmsg_t *conf,
-    const char *path, int number, struct dvb_frontend_info *dfi )
+    const char *path, int number, const char *name )
 {
   linuxdvb_adapter_t *la;
   char buf[1024];
@@ -146,7 +166,7 @@ linuxdvb_adapter_create
   }
 
   /* Setup */
-  sprintf(buf, "%s [%s]", path, dfi->name);
+  sprintf(buf, "%s [%s]", path, name);
   free(la->la_rootpath);
   la->la_rootpath   = strdup(path);
   la->la_name       = strdup(buf);
@@ -161,8 +181,43 @@ linuxdvb_adapter_create
 /*
  *
  */
+static linuxdvb_adapter_t *
+linuxdvb_adapter_new(const char *path, int a, const char *name,
+                     htsmsg_t **conf, int *save)
+{
+  linuxdvb_adapter_t *la;
+  SHA_CTX sha1;
+  uint8_t uuidbin[20];
+  tvh_uuid_t uuid;
+
+  /* Create hash for adapter */
+  SHA1_Init(&sha1);
+  SHA1_Update(&sha1, (void*)path,     strlen(path));
+  SHA1_Update(&sha1, (void*)name,     strlen(name));
+  SHA1_Final(uuidbin, &sha1);
+  bin2hex(uuid.hex, sizeof(uuid.hex), uuidbin, sizeof(uuidbin));
+
+  /* Load config */
+  *conf = hts_settings_load("input/linuxdvb/adapters/%s", uuid.hex);
+  if (*conf == NULL)
+    *save = 1;
+
+  /* Create */
+  if (!(la = linuxdvb_adapter_create(uuid.hex, *conf, path, a, name))) {
+    htsmsg_destroy(*conf);
+    *conf = NULL;
+    return NULL;
+  }
+
+  tvhinfo("linuxdvb", "adapter added %s", path);
+  return la;
+}
+
+/*
+ *
+ */
 static dvb_fe_type_t
-linux_dvb_get_type(int linux_type)
+linuxdvb_get_type(int linux_type)
 {
   switch (linux_type) {
   case FE_QPSK:
@@ -179,6 +234,43 @@ linux_dvb_get_type(int linux_type)
 }
 
 /*
+ *
+ */
+#if DVB_VER_ATLEAST(5,5)
+static void
+linuxdvb_get_systems(int fd, struct dtv_property *_cmd)
+{
+  struct dtv_property cmd = {
+    .cmd = DTV_ENUM_DELSYS
+  };
+  struct dtv_properties cmdseq = {
+    .num   = 1,
+    .props = &cmd
+  };
+  int r;
+
+  r = ioctl(fd, FE_GET_PROPERTY, &cmdseq);
+  if (!r && cmd.u.buffer.len) {
+    struct dtv_property fecmd[2] = {
+      {
+        .cmd    = DTV_DELIVERY_SYSTEM,
+        .u.data = cmd.u.buffer.data[0]
+      },
+      {
+        .cmd    = DTV_TUNE
+      }
+    };
+    cmdseq.props = fecmd;
+    cmdseq.num   = 2;
+    r = ioctl(fd, FE_SET_PROPERTY, &cmdseq);
+  } else {
+    cmd.u.buffer.len = 0;
+  }
+  *_cmd = cmd;
+}
+#endif
+
+/*
  * Add adapter by path
  */
 static void
@@ -188,24 +280,20 @@ linuxdvb_adapter_add ( const char *path )
   extern int linuxdvb_adapter_mask;
   int a, i, j, r, fd;
   char fe_path[512], dmx_path[512], dvr_path[512];
-  tvh_uuid_t uuid;
+#if ENABLE_LINUXDVB_CA
+  char ca_path[512];
+  htsmsg_t *caconf = NULL;
+#endif
   linuxdvb_adapter_t *la = NULL;
   struct dvb_frontend_info dfi;
-  SHA_CTX sha1;
-  uint8_t uuidbin[20];
-  htsmsg_t *conf, *feconf;
+  htsmsg_t *conf = NULL, *feconf = NULL;
   int save = 0;
   dvb_fe_type_t type;
 #if DVB_VER_ATLEAST(5,5)
   int delsys;
-  dvb_fe_type_t fetypes[DVB_TYPE_LAST+1] = { 0 };
-  struct dtv_property   cmd = {
-    .cmd = DTV_ENUM_DELSYS
-  };
-  struct dtv_properties cmdseq = {
-    .num   = 1,
-    .props = &cmd
-  };
+  dvb_fe_type_t fetypes[DVB_TYPE_LAST+1];
+  struct dtv_property cmd;
+  linuxdvb_frontend_t *lfe;
 #endif
 
   /* Validate the path */
@@ -222,8 +310,6 @@ linuxdvb_adapter_add ( const char *path )
 
   /* Process each frontend */
   for (i = 0; i < 32; i++) {
-    conf = feconf = NULL;
-
     snprintf(fe_path, sizeof(fe_path), FE_PATH, path, i);
 
     /* Wait for access (first FE can take a fe ms to be setup) */
@@ -245,23 +331,7 @@ linuxdvb_adapter_add ( const char *path )
       continue;
     }
 #if DVB_VER_ATLEAST(5,5)
-    r = ioctl(fd, FE_GET_PROPERTY, &cmdseq);
-    if (!r && cmd.u.buffer.len) {
-      struct dtv_property fecmd[2] = {
-        {
-          .cmd    = DTV_DELIVERY_SYSTEM,
-          .u.data = cmd.u.buffer.data[0]
-        },
-        {
-          .cmd    = DTV_TUNE
-        }
-      };
-      cmdseq.props = fecmd;
-      cmdseq.num   = 2;
-      r = ioctl(fd, FE_SET_PROPERTY, &cmdseq);
-    } else {
-      cmd.u.buffer.len = 0;
-    }
+    linuxdvb_get_systems(fd, &cmd);
 #endif
     r = ioctl(fd, FE_GET_INFO, &dfi);
     close(fd);
@@ -269,7 +339,7 @@ linuxdvb_adapter_add ( const char *path )
       tvhlog(LOG_ERR, "linuxdvb", "unable to query %s", fe_path);
       continue;
     }
-    type = linux_dvb_get_type(dfi.type);
+    type = linuxdvb_get_type(dfi.type);
     if (type == DVB_TYPE_NONE) {
       tvhlog(LOG_ERR, "linuxdvb", "unable to determine FE type %s - %i", fe_path, dfi.type);
       continue;
@@ -291,33 +361,19 @@ linuxdvb_adapter_add ( const char *path )
     /* Create/Find adapter */
     pthread_mutex_lock(&global_lock);
     if (!la) {
-
-      /* Create hash for adapter */
-      SHA1_Init(&sha1); 
-      SHA1_Update(&sha1, (void*)path,     strlen(path));
-      SHA1_Update(&sha1, (void*)dfi.name, strlen(dfi.name));
-      SHA1_Final(uuidbin, &sha1);
-      bin2hex(uuid.hex, sizeof(uuid.hex), uuidbin, sizeof(uuidbin));
-
-      /* Load config */
-      conf = hts_settings_load("input/linuxdvb/adapters/%s", uuid.hex);
-      if (conf)
-        feconf = htsmsg_get_map(conf, "frontends");
-      else
-        save = 1;
-  
-      /* Create */
-      if (!(la = linuxdvb_adapter_create(uuid.hex, conf, path, a, &dfi))) {
+      la = linuxdvb_adapter_new(path, a, dfi.name, &conf, &save);
+      if (la == NULL) {
         tvhlog(LOG_ERR, "linuxdvb", "failed to create %s", path);
-        htsmsg_destroy(conf);
         return; // Note: save to return here as global_lock is held
       }
-      tvhinfo("linuxdvb", "adapter added %s", path);
+      if (conf)
+        feconf = htsmsg_get_map(conf, "frontends");
     }
 
     /* Create frontend */
     linuxdvb_frontend_create(feconf, la, i, fe_path, dmx_path, dvr_path, type, dfi.name);
 #if DVB_VER_ATLEAST(5,5)
+    memset(fetypes, 0, sizeof(fetypes));
     fetypes[type] = 1;
     for (j = 0; j < cmd.u.buffer.len; j++) {
       delsys = cmd.u.buffer.data[j];
@@ -340,11 +396,69 @@ linuxdvb_adapter_add ( const char *path )
     }
 #endif
     pthread_mutex_unlock(&global_lock);
-    htsmsg_destroy(conf);
   }
+
+  /* Process each CA device */
+#if ENABLE_LINUXDVB_CA
+  for (i = 0; i < 32; i++) {
+    snprintf(ca_path, sizeof(ca_path), CA_PATH, path, i);
+    if (access(ca_path, R_OK | W_OK)) continue;
+
+    /* Get ca info */
+    for (j = 0; j < MAX_DEV_OPEN_ATTEMPTS; j++) {
+      if ((fd = tvh_open(ca_path, O_RDWR, 0)) >= 0) break;
+      usleep(100000);
+    }
+    if (fd < 0) {
+      tvhlog(LOG_ERR, "linuxdvb", "unable to open %s", ca_path);
+      continue;
+    }
+    r = ioctl(fd, CA_RESET, NULL);
+    close(fd);
+    if(r) {
+      tvhlog(LOG_ERR, "linuxdvb", "unable to query %s", ca_path);
+      continue;
+    }
+
+    pthread_mutex_lock(&global_lock);
+
+    if (!la) {
+      la = linuxdvb_adapter_new(path, a, ca_path, &conf, &save);
+      if (la == NULL) {
+        tvhlog(LOG_ERR, "linuxdvb", "failed to create %s", path);
+        return; // Note: save to return here as global_lock is held
+      }
+    }
+
+    if (conf)
+      caconf = htsmsg_get_map(conf, "ca_devices");
+
+    linuxdvb_ca_create(caconf, la, i, ca_path);
+    pthread_mutex_unlock(&global_lock);
+  }
+#endif
+
+  /* Cleanup */
+  if (conf)
+    htsmsg_destroy(conf);
 
   /* Relock before exit */
   pthread_mutex_lock(&global_lock);
+
+  /* Adapter couldn't be opened; there's nothing to work with  */
+  if (!la)
+    return;
+
+#if DVB_VER_ATLEAST(5,5)
+  memset(fetypes, 0, sizeof(fetypes));
+  LIST_FOREACH(lfe, &la->la_frontends, lfe_link)
+    fetypes[lfe->lfe_type]++;
+  for (i = 0; i < ARRAY_SIZE(fetypes); i++)
+    if (fetypes[i] > 1)
+      tvhwarn("linuxdvb", "adapter %d has multiple tuners %d for type %s, "
+                          "only one can be used at a time",
+                          a, fetypes[i], dvb_type2str(i));
+#endif
 
   /* Save configuration */
   if (save && la)
@@ -356,7 +470,7 @@ linuxdvb_adapter_del ( const char *path )
 {
   int a;
   linuxdvb_frontend_t *lfe, *next;
-  linuxdvb_adapter_t *la;
+  linuxdvb_adapter_t *la = NULL;
   tvh_hardware_t *th;
 
   if (sscanf(path, "/dev/dvb/adapter%d", &a) == 1) {
