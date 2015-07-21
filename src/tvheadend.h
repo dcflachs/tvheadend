@@ -1,6 +1,6 @@
 /*
  *  Tvheadend - structures
- *  Copyright (C) 2007 Andreas Öman
+ *  Copyright (C) 2007 Andreas Ã–man
  *
  *  This program is free software: you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -43,6 +43,10 @@
 #include "tvhlog.h"
 
 #include "redblack.h"
+
+#define STRINGIFY(s) # s
+#define SRCLINEID() SRCLINEID2(__FILE__, __LINE__)
+#define SRCLINEID2(f,l) f ":" STRINGIFY(l)
 
 #define ERRNO_AGAIN(e) ((e) == EAGAIN || (e) == EINTR || (e) == EWOULDBLOCK)
 
@@ -99,7 +103,6 @@ typedef struct str_list
 extern int tvheadend_running;
 
 extern pthread_mutex_t global_lock;
-extern pthread_mutex_t ffmpeg_lock;
 extern pthread_mutex_t fork_lock;
 extern pthread_mutex_t atomic_lock;
 
@@ -111,6 +114,7 @@ typedef struct source_info {
   char *si_device;
   char *si_adapter;
   char *si_network;
+  char *si_satpos;
   char *si_mux;
   char *si_provider;
   char *si_service;
@@ -149,7 +153,6 @@ typedef enum {
  * global timer
  */
 
-
 typedef void (gti_callback_t)(void *opaque);
 
 typedef struct gtimer {
@@ -157,21 +160,55 @@ typedef struct gtimer {
   gti_callback_t *gti_callback;
   void *gti_opaque;
   struct timespec gti_expire;
+#if ENABLE_GTIMER_CHECK
+  const char *gti_id;
+  const char *gti_fcn;
+#endif
 } gtimer_t;
 
-void gtimer_arm(gtimer_t *gti, gti_callback_t *callback, void *opaque,
-		int delta);
+#if ENABLE_GTIMER_CHECK
+#define GTIMER_TRACEID_ const char *id, const char *fcn,
+#define GTIMER_FCN(n) check_##n
+#else
+#define GTIMER_TRACEID_
+#define GTIMER_FCN(n) n
+#endif
 
-void gtimer_arm_ms(gtimer_t *gti, gti_callback_t *callback, void *opaque,
-  long delta_ms);
+void GTIMER_FCN(gtimer_arm)
+  (GTIMER_TRACEID_ gtimer_t *gti, gti_callback_t *callback, void *opaque, int delta);
+void GTIMER_FCN(gtimer_arm_ms)
+  (GTIMER_TRACEID_ gtimer_t *gti, gti_callback_t *callback, void *opaque, long delta_ms);
+void GTIMER_FCN(gtimer_arm_abs)
+  (GTIMER_TRACEID_ gtimer_t *gti, gti_callback_t *callback, void *opaque, time_t when);
+void GTIMER_FCN(gtimer_arm_abs2)
+  (GTIMER_TRACEID_ gtimer_t *gti, gti_callback_t *callback, void *opaque, struct timespec *when);
 
-void gtimer_arm_abs(gtimer_t *gti, gti_callback_t *callback, void *opaque,
-		    time_t when);
-
-void gtimer_arm_abs2(gtimer_t *gti, gti_callback_t *callback, void *opaque,
-  struct timespec *when);
+#if ENABLE_GTIMER_CHECK
+#define gtimer_arm(a, b, c, d) GTIMER_FCN(gtimer_arm)(SRCLINEID(), __func__, a, b, c, d)
+#define gtimer_arm_ms(a, b, c, d) GTIMER_FCN(gtimer_arm_ms)(SRCLINEID(), __func__, a, b, c, d)
+#define gtimer_arm_abs(a, b, c, d) GTIMER_FCN(gtimer_arm_abs)(SRCLINEID(), __func__, a, b, c, d)
+#define gtimer_arm_abs2(a, b, c, d) GTIMER_FCN(gtimer_arm_abs2)(SRCLINEID(), __func__, a, b, c, d)
+#endif
 
 void gtimer_disarm(gtimer_t *gti);
+
+
+/*
+ * tasklet
+ */
+
+typedef void (tsk_callback_t)(void *opaque, int disarmed);
+
+typedef struct tasklet {
+  TAILQ_ENTRY(tasklet) tsk_link;
+  tsk_callback_t *tsk_callback;
+  void *tsk_opaque;
+  int tsk_allocated;
+} tasklet_t;
+
+tasklet_t *tasklet_arm_alloc(tsk_callback_t *callback, void *opaque);
+void tasklet_arm(tasklet_t *tsk, tsk_callback_t *callback, void *opaque);
+void tasklet_disarm(tasklet_t *gti);
 
 
 /*
@@ -215,7 +252,8 @@ int get_device_connection(const char *dev);
 typedef enum {
   SCT_NONE = -1,
   SCT_UNKNOWN = 0,
-  SCT_MPEG2VIDEO = 1,
+  SCT_RAW = 1,
+  SCT_MPEG2VIDEO,
   SCT_MPEG2AUDIO,
   SCT_H264,
   SCT_AC3,
@@ -251,7 +289,7 @@ typedef enum {
 typedef enum {
   SIGNAL_STATUS_SCALE_UNKNOWN = 0,
   SIGNAL_STATUS_SCALE_RELATIVE, // value is unsigned, where 0 means 0% and 65535 means 100%
-  SIGNAL_STATUS_SCALE_DECIBEL   // value is measured in dB
+  SIGNAL_STATUS_SCALE_DECIBEL   // value is measured in dB * 1000
 } signal_status_scale_t;
 
 /**
@@ -504,10 +542,10 @@ typedef struct streaming_queue {
  */
 typedef struct sbuf {
   uint8_t *sb_data;
-  int sb_ptr;
-  int sb_size;
-  unsigned int sb_err  : 1;
-  unsigned int sb_bswap: 1;
+  int      sb_ptr;
+  int      sb_size;
+  uint16_t sb_err;
+  uint8_t  sb_bswap;
 } sbuf_t;
 
 
@@ -574,12 +612,14 @@ extern void scopedunlock(pthread_mutex_t **mtxp);
 
 #define scopedgloballock() scopedlock(&global_lock)
 
-#define tvh_strdupa(n) ({ int tvh_l = strlen(n); \
- char *tvh_b = alloca(tvh_l + 1); \
- memcpy(tvh_b, n, tvh_l + 1); })
+#define tvh_strdupa(n) \
+  ({ int tvh_l = strlen(n); \
+     char *tvh_b = alloca(tvh_l + 1); \
+     memcpy(tvh_b, n, tvh_l + 1); })
 
-#define tvh_strlcatf(buf, size, fmt...) \
- snprintf((buf) + strlen(buf), (size) - strlen(buf), fmt)
+#define tvh_strlcatf(buf, size, ptr, fmt...) \
+  do { int __r = snprintf((buf) + ptr, (size) - ptr, fmt); \
+       ptr = __r >= (size) - ptr ? (size) - 1 : ptr + __r; } while (0)
 
 static inline const char *tvh_strbegins(const char *s1, const char *s2)
 {
@@ -659,12 +699,12 @@ void sbuf_reset_and_alloc(sbuf_t *sb, int len);
 static inline void sbuf_steal_data(sbuf_t *sb)
 {
   sb->sb_data = NULL;
-  sb->sb_ptr = sb->sb_size = 0;
+  sb->sb_ptr = sb->sb_size = sb->sb_err = 0;
 }
 
-static inline void sbuf_err(sbuf_t *sb)
+static inline void sbuf_err(sbuf_t *sb, int errors)
 {
-  sb->sb_err = 1;
+  sb->sb_err += errors;
 }
 
 void sbuf_alloc_(sbuf_t *sb, int len);
@@ -674,6 +714,8 @@ static inline void sbuf_alloc(sbuf_t *sb, int len)
   if (sb->sb_ptr + len >= sb->sb_size)
     sbuf_alloc_(sb, len);
 }
+
+void sbuf_realloc(sbuf_t *sb, int len);
 
 void sbuf_append(sbuf_t *sb, const void *data, int len);
 
@@ -705,7 +747,7 @@ static inline uint8_t *sbuf_peek(sbuf_t *sb, int off) { return sb->sb_data + off
 
 char *md5sum ( const char *str );
 
-int makedirs ( const char *path, int mode );
+int makedirs ( const char *path, int mode, gid_t gid, uid_t uid );
 
 int rmtree ( const char *path );
 
@@ -714,6 +756,10 @@ char *regexp_escape ( const char *str );
 /* URL decoding */
 char to_hex(char code);
 char *url_encode(char *str);
+
+int mpegts_word_count(const uint8_t *tsb, int len, uint32_t mask);
+
+int deferred_unlink(const char *filename, const char *rootdir);
 
 static inline int32_t deltaI32(int32_t a, int32_t b) { return (a > b) ? (a - b) : (b - a); }
 static inline uint32_t deltaU32(uint32_t a, uint32_t b) { return (a > b) ? (a - b) : (b - a); }

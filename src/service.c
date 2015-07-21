@@ -53,6 +53,7 @@ static void service_class_delete(struct idnode *self);
 static void service_class_save(struct idnode *self);
 
 struct service_queue service_all;
+struct service_queue service_raw_all;
 
 static void
 service_class_notify_enabled ( void *obj )
@@ -119,7 +120,7 @@ service_class_channel_set
 
   /* no save - the link information is in the saved channel record */
   /* only send a notify about the change to other clients */
-  idnode_notify_simple(&svc->s_id);
+  idnode_notify_changed(&svc->s_id);
   return 0;
 }
 
@@ -223,6 +224,12 @@ const idclass_t service_class = {
       .opts     = PO_NOSAVE
     },
     {
+      .type     = PT_INT,
+      .id       = "priority",
+      .name     = "Priority (-10..10)",
+      .off      = offsetof(service_t, s_prio),
+    },
+    {
       .type     = PT_BOOL,
       .id       = "encrypted",
       .name     = "Encrypted",
@@ -240,6 +247,17 @@ const idclass_t service_class = {
   }
 };
 
+const idclass_t service_raw_class = {
+  .ic_class      = "service_raw",
+  .ic_caption    = "Service Raw",
+  .ic_event      = "service_raw",
+  .ic_perm_def   = ACCESS_ADMIN,
+  .ic_delete     = service_class_delete,
+  .ic_save       = NULL,
+  .ic_get_title  = service_class_get_title,
+  .ic_properties = NULL
+};
+
 /**
  *
  */
@@ -248,15 +266,11 @@ stream_init(elementary_stream_t *st)
 {
   st->es_cc = -1;
 
+  st->es_parser_state = 0;
   st->es_startcond = 0xffffffff;
   st->es_curdts = PTS_UNSET;
   st->es_curpts = PTS_UNSET;
   st->es_prevdts = PTS_UNSET;
-
-  st->es_pcr_real_last = PTS_UNSET;
-  st->es_pcr_last      = PTS_UNSET;
-  st->es_pcr_drift     = 0;
-  st->es_pcr_recovery_fails = 0;
 
   st->es_blank = 0;
 }
@@ -511,7 +525,7 @@ ca_ignore:
               ca->filter |= ESFM_IGNORE;
             st->es_filter |= ESFM_IGNORE;
             break;
-          case ESFA_ONCE:
+          case ESFA_ONE_TIME:
             TAILQ_FOREACH(st2, &t->s_components, es_link)
               if (st2->es_type == SCT_CA && (st2->es_filter & ESFM_USED) != 0)
                 break;
@@ -560,7 +574,7 @@ ca_ignore:
 ignore:
             st->es_filter |= ESFM_IGNORE;
             break;
-          case ESFA_ONCE:
+          case ESFA_ONE_TIME:
             TAILQ_FOREACH(st2, &t->s_components, es_link) {
               if (st == st2)
                 continue;
@@ -625,7 +639,7 @@ ignore:
  *
  */
 int
-service_start(service_t *t, int instance, int timeout, int postpone)
+service_start(service_t *t, int instance, int flags, int timeout, int postpone)
 {
   elementary_stream_t *st;
   int r, stimeout = 10;
@@ -645,7 +659,7 @@ service_start(service_t *t, int instance, int timeout, int postpone)
   descrambler_caid_changed(t);
   pthread_mutex_unlock(&t->s_stream_mutex);
 
-  if((r = t->s_start_feed(t, instance)))
+  if((r = t->s_start_feed(t, instance, flags)))
     return r;
 
   descrambler_service_start(t);
@@ -680,7 +694,8 @@ service_start(service_t *t, int instance, int timeout, int postpone)
  */
 service_instance_t *
 service_find_instance
-  (service_t *s, channel_t *ch, service_instance_list_t *sil,
+  (service_t *s, channel_t *ch, tvh_input_t *ti,
+   service_instance_list_t *sil,
    int *error, int weight, int flags, int timeout, int postpone)
 {
   channel_service_mapping_t *csm;
@@ -694,13 +709,17 @@ service_find_instance
     si->si_mark = 1;
 
   if (ch) {
+    if (!ch->ch_enabled) {
+      *error = SM_CODE_SVC_NOT_ENABLED;
+      return NULL;
+    }
     LIST_FOREACH(csm, &ch->ch_services, csm_chn_link) {
       s = csm->csm_svc;
       if (s->s_is_enabled(s, flags))
-        s->s_enlist(s, sil, flags);
+        s->s_enlist(s, ti, sil, flags);
     }
   } else {
-    s->s_enlist(s, sil, flags);
+    s->s_enlist(s, ti, sil, flags);
   }
 
   /* Clean */
@@ -714,8 +733,8 @@ service_find_instance
   TAILQ_FOREACH(si, sil, si_link) {
     const char *name = ch ? channel_get_name(ch) : NULL;
     if (!name && s) name = s->s_nicename;
-    tvhdebug("service", "%s si %p %s weight %d prio %d error %d",
-             name, si, si->si_source, si->si_weight, si->si_prio,
+    tvhdebug("service", "%d: %s si %p %s weight %d prio %d error %d",
+             si->si_instance, name, si, si->si_source, si->si_weight, si->si_prio,
              si->si_error);
   }
 
@@ -759,7 +778,7 @@ service_find_instance
 
   /* Start */
   tvhtrace("service", "will start new instance %d", si->si_instance);
-  if (service_start(si->si_s, si->si_instance, timeout, postpone)) {
+  if (service_start(si->si_s, si->si_instance, flags, timeout, postpone)) {
     tvhtrace("service", "tuning failed");
     si->si_error = SM_CODE_TUNING_FAILED;
     if (*error < SM_CODE_TUNING_FAILED)
@@ -836,7 +855,10 @@ service_destroy(service_t *t, int delconf)
 
   avgstat_flush(&t->s_rate);
 
-  TAILQ_REMOVE(&service_all, t, s_all_link);
+  if (t->s_type == STYPE_RAW)
+    TAILQ_REMOVE(&service_raw_all, t, s_all_link);
+  else
+    TAILQ_REMOVE(&service_all, t, s_all_link);
 
   service_unref(t);
 }
@@ -849,7 +871,7 @@ service_set_enabled(service_t *t, int enabled, int _auto)
     t->s_auto = _auto;
     service_class_notify_enabled(t);
     service_request_save(t, 0);
-    idnode_notify_simple(&t->s_id);
+    idnode_notify_changed(&t->s_id);
   }
 }
 
@@ -876,7 +898,8 @@ service_provider_name ( service_t *s )
  */
 service_t *
 service_create0
-  ( service_t *t, const idclass_t *class, const char *uuid,
+  ( service_t *t, int service_type,
+    const idclass_t *class, const char *uuid,
     int source_type, htsmsg_t *conf )
 {
   if (idnode_insert(&t->s_id, uuid, class, 0)) {
@@ -888,10 +911,14 @@ service_create0
 
   lock_assert(&global_lock);
   
-  TAILQ_INSERT_TAIL(&service_all, t, s_all_link);
+  if (service_type == STYPE_RAW)
+    TAILQ_INSERT_TAIL(&service_raw_all, t, s_all_link);
+  else
+    TAILQ_INSERT_TAIL(&service_all, t, s_all_link);
 
   pthread_mutex_init(&t->s_stream_mutex, NULL);
   pthread_cond_init(&t->s_tss_cond, NULL);
+  t->s_type = service_type;
   t->s_source_type = source_type;
   t->s_refcount = 1;
   t->s_enabled = 1;
@@ -910,6 +937,7 @@ service_create0
 
   return t;
 }
+
 
 /**
  *
@@ -1011,9 +1039,6 @@ service_stream_create(service_t *t, int pid,
   avgstat_init(&st->es_cc_errors, 10);
 
   service_stream_make_nicename(t, st);
-
-  if(t->s_flags & S_DEBUG)
-    tvhlog(LOG_DEBUG, "service", "Add stream %s", st->es_nicename);
 
   if(t->s_status == SERVICE_RUNNING) {
     service_build_filter(t);
@@ -1198,6 +1223,9 @@ service_restart(service_t *t)
 {
   int had_components;
 
+  if(t->s_type != STYPE_STD)
+    goto refresh;
+
   pthread_mutex_lock(&t->s_stream_mutex);
 
   had_components = TAILQ_FIRST(&t->s_filt_components) != NULL &&
@@ -1224,6 +1252,7 @@ service_restart(service_t *t)
 
   pthread_mutex_unlock(&t->s_stream_mutex);
 
+refresh:
   if(t->s_refresh_feed != NULL)
     t->s_refresh_feed(t);
 
@@ -1295,6 +1324,9 @@ static struct service_queue pending_save_queue;
 void
 service_request_save(service_t *t, int restart)
 {
+  if (t->s_type != STYPE_STD && !restart)
+    return;
+
   pthread_mutex_lock(&pending_save_mutex);
 
   if(!t->s_ps_onqueue) {
@@ -1356,7 +1388,7 @@ service_saver(void *aux)
     pthread_mutex_unlock(&pending_save_mutex);
     pthread_mutex_lock(&global_lock);
 
-    if(t->s_status != SERVICE_ZOMBIE)
+    if(t->s_status != SERVICE_ZOMBIE && t->s_config_save)
       t->s_config_save(t);
     if(t->s_status == SERVICE_RUNNING && restart)
       service_restart(t);
@@ -1381,6 +1413,7 @@ service_init(void)
 {
   TAILQ_INIT(&pending_save_queue);
   TAILQ_INIT(&service_all);
+  TAILQ_INIT(&service_raw_all);
   pthread_mutex_init(&pending_save_mutex, NULL);
   pthread_cond_init(&pending_save_cond, NULL);
   tvhthread_create(&service_saver_tid, NULL, service_saver, NULL);
@@ -1405,6 +1438,7 @@ service_source_info_free(struct source_info *si)
   free(si->si_mux);
   free(si->si_provider);
   free(si->si_service);
+  free(si->si_satpos);
 }
 
 
@@ -1418,6 +1452,7 @@ service_source_info_copy(source_info_t *dst, const source_info_t *src)
   COPY(mux);
   COPY(provider);
   COPY(service);
+  COPY(satpos);
 #undef COPY
 }
 
@@ -1535,6 +1570,8 @@ service_instance_add(service_instance_list_t *sil,
                      const char *source, int prio, int weight)
 {
   service_instance_t *si;
+
+  prio += 10 + MAX(-10, MIN(10, s->s_prio));
 
   /* Existing */
   TAILQ_FOREACH(si, sil, si_link)

@@ -1,6 +1,6 @@
 /*
  *  tvheadend, HTTP interface
- *  Copyright (C) 2007 Andreas Öman
+ *  Copyright (C) 2007 Andreas Ã–man
  *
  *  This program is free software: you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <ctype.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <signal.h>
@@ -33,15 +34,17 @@
 #include "tvheadend.h"
 #include "tcp.h"
 #include "http.h"
+#include "filebundle.h"
 #include "access.h"
 #include "notify.h"
 #include "channels.h"
 
-static void *http_server;
+void *http_server;
 
-static LIST_HEAD(, http_path) http_paths;
+static http_path_list_t http_paths;
 
 static struct strtab HTTP_cmdtab[] = {
+  { "NONE",       HTTP_CMD_NONE },
   { "GET",        HTTP_CMD_GET },
   { "HEAD",       HTTP_CMD_HEAD },
   { "POST",       HTTP_CMD_POST },
@@ -60,8 +63,6 @@ static struct strtab HTTP_versiontab[] = {
   { "HTTP/1.1",        HTTP_VERSION_1_1 },
   { "RTSP/1.0",        RTSP_VERSION_1_0 },
 };
-
-static void http_parse_get_args(http_connection_t *hc, char *args);
 
 /**
  *
@@ -113,7 +114,7 @@ http_resolve(http_connection_t *hc, char **remainp, char **argsp)
 
   while (1) {
 
-    LIST_FOREACH(hp, &http_paths, hp_link) {
+    LIST_FOREACH(hp, hc->hc_paths, hp_link) {
       if(!strncmp(path, hp->hp_path, hp->hp_len)) {
         if(path[hp->hp_len] == 0 ||
            path[hp->hp_len] == '/' ||
@@ -185,12 +186,16 @@ http_rc2str(int code)
   switch(code) {
   case HTTP_STATUS_OK:              return "OK";
   case HTTP_STATUS_PARTIAL_CONTENT: return "Partial Content";
-  case HTTP_STATUS_NOT_FOUND:       return "Not found";
-  case HTTP_STATUS_UNAUTHORIZED:    return "Unauthorized";
-  case HTTP_STATUS_BAD_REQUEST:     return "Bad request";
   case HTTP_STATUS_FOUND:           return "Found";
+  case HTTP_STATUS_BAD_REQUEST:     return "Bad Request";
+  case HTTP_STATUS_UNAUTHORIZED:    return "Unauthorized";
+  case HTTP_STATUS_NOT_FOUND:       return "Not Found";
+  case HTTP_STATUS_UNSUPPORTED:     return "Unsupported Media Type";
+  case HTTP_STATUS_BANDWIDTH:       return "Not Enough Bandwidth";
+  case HTTP_STATUS_BAD_SESSION:     return "Session Not Found";
+  case HTTP_STATUS_HTTP_VERSION:    return "HTTP/RTSP Version Not Supported";
   default:
-    return "Unknown returncode";
+    return "Unknown Code";
     break;
   }
 }
@@ -212,22 +217,26 @@ http_send_header(http_connection_t *hc, int rc, const char *content,
 		 int64_t contentlen,
 		 const char *encoding, const char *location, 
 		 int maxage, const char *range,
-		 const char *disposition)
+		 const char *disposition,
+		 http_arg_list_t *args)
 {
   struct tm tm0, *tm;
   htsbuf_queue_t hdrs;
+  http_arg_t *ra;
   time_t t;
+  int sess = 0;
 
   htsbuf_queue_init(&hdrs, 0);
 
   htsbuf_qprintf(&hdrs, "%s %d %s\r\n", 
-		 val2str(hc->hc_version, HTTP_versiontab),
-		 rc, http_rc2str(rc));
+		 http_ver2str(hc->hc_version), rc, http_rc2str(rc));
 
-  htsbuf_qprintf(&hdrs, "Server: HTS/tvheadend\r\n");
+  if (hc->hc_version != RTSP_VERSION_1_0)
+    htsbuf_qprintf(&hdrs, "Server: HTS/tvheadend\r\n");
 
   if(maxage == 0) {
-    htsbuf_qprintf(&hdrs, "Cache-Control: no-cache\r\n");
+    if (hc->hc_version != RTSP_VERSION_1_0)
+      htsbuf_qprintf(&hdrs, "Cache-Control: no-cache\r\n");
   } else {
     time(&t);
 
@@ -258,8 +267,9 @@ http_send_header(http_connection_t *hc, int rc, const char *content,
     htsbuf_qprintf(&hdrs, "Set-Cookie: logout=0; Path=\"/logout'\"; expires=Thu, 01 Jan 1970 00:00:00 GMT\r\n");
   }
 
-  htsbuf_qprintf(&hdrs, "Connection: %s\r\n", 
-	      hc->hc_keep_alive ? "Keep-Alive" : "Close");
+  if (hc->hc_version != RTSP_VERSION_1_0)
+    htsbuf_qprintf(&hdrs, "Connection: %s\r\n",
+	           hc->hc_keep_alive ? "Keep-Alive" : "Close");
 
   if(encoding != NULL)
     htsbuf_qprintf(&hdrs, "Content-Encoding: %s\r\n", encoding);
@@ -281,12 +291,61 @@ http_send_header(http_connection_t *hc, int rc, const char *content,
   if(disposition != NULL)
     htsbuf_qprintf(&hdrs, "Content-Disposition: %s\r\n", disposition);
   
+  if(hc->hc_cseq) {
+    htsbuf_qprintf(&hdrs, "CSeq: %"PRIu64"\r\n", hc->hc_cseq);
+    if (++hc->hc_cseq == 0)
+      hc->hc_cseq = 1;
+  }
+
+  if (args) {
+    TAILQ_FOREACH(ra, args, link) {
+      if (strcmp(ra->key, "Session") == 0)
+        sess = 1;
+      htsbuf_qprintf(&hdrs, "%s: %s\r\n", ra->key, ra->val);
+    }
+  }
+  if(hc->hc_session && !sess)
+    htsbuf_qprintf(&hdrs, "Session: %s\r\n", hc->hc_session);
+
   htsbuf_qprintf(&hdrs, "\r\n");
 
   tcp_write_queue(hc->hc_fd, &hdrs);
 }
 
+/*
+ *
+ */
+int
+http_encoding_valid(http_connection_t *hc, const char *encoding)
+{
+  const char *accept;
+  char *tokbuf, *tok, *saveptr = NULL, *q, *s;
 
+  accept = http_arg_get(&hc->hc_args, "accept-encoding");
+  if (!accept)
+    return 0;
+
+  tokbuf = tvh_strdupa(accept);
+  tok = strtok_r(tokbuf, ",", &saveptr);
+  while (tok) {
+    while (*tok == ' ')
+      tok++;
+    // check for semicolon
+    if ((q = strchr(tok, ';')) != NULL) {
+      *q = '\0';
+      q++;
+      while (*q == ' ')
+        q++;
+    }
+    if ((s = strchr(tok, ' ')) != NULL)
+      *s = '\0';
+    // check for matching encoding with q > 0
+    if ((!strcasecmp(tok, encoding) || !strcmp(tok, "*")) && (q == NULL || strncmp(q, "q=0.000", strlen(q))))
+      return 1;
+    tok = strtok_r(NULL, ",", &saveptr);
+  }
+  return 0;
+}
 
 /**
  * Transmit a HTTP reply
@@ -295,13 +354,29 @@ static void
 http_send_reply(http_connection_t *hc, int rc, const char *content, 
 		const char *encoding, const char *location, int maxage)
 {
-  http_send_header(hc, rc, content, hc->hc_reply.hq_size,
-		   encoding, location, maxage, 0, NULL);
-  
-  if(hc->hc_no_output)
-    return;
+  size_t size = hc->hc_reply.hq_size;
+  uint8_t *data = NULL;
 
-  tcp_write_queue(hc->hc_fd, &hc->hc_reply);
+#if ENABLE_ZLIB
+  if (http_encoding_valid(hc, "gzip") && encoding == NULL && size > 256) {
+    uint8_t *data2 = (uint8_t *)htsbuf_to_string(&hc->hc_reply);
+    data = gzip_deflate(data2, size, &size);
+    free(data2);
+    encoding = "gzip";
+  }
+#endif
+
+  http_send_header(hc, rc, content, size,
+		   encoding, location, maxage, 0, NULL, NULL);
+  
+  if(!hc->hc_no_output) {
+    if (data == NULL)
+      tcp_write_queue(hc->hc_fd, &hc->hc_reply);
+    else
+      tvh_write(hc->hc_fd, data, size);
+  }
+
+  free(data);
 }
 
 
@@ -312,32 +387,34 @@ void
 http_error(http_connection_t *hc, int error)
 {
   const char *errtxt = http_rc2str(error);
-  char addrstr[50];
 
   if (!http_server) return;
 
-  tcp_get_ip_str((struct sockaddr*)hc->hc_peer, addrstr, 50);
-
   if (error != HTTP_STATUS_FOUND && error != HTTP_STATUS_MOVED)
-    tvhlog(error < 400 ? LOG_INFO : LOG_ERR, "HTTP", "%s: %s -- %d",
-	   addrstr, hc->hc_url, error);
+    tvhlog(error < 400 ? LOG_INFO : LOG_ERR, "http", "%s: %s %s %s -- %d",
+	   hc->hc_peer_ipstr, http_ver2str(hc->hc_version),
+           http_cmd2str(hc->hc_cmd), hc->hc_url, error);
 
-  htsbuf_queue_flush(&hc->hc_reply);
+  if (hc->hc_version != RTSP_VERSION_1_0) {
+    htsbuf_queue_flush(&hc->hc_reply);
 
-  htsbuf_qprintf(&hc->hc_reply, 
-		 "<!DOCTYPE HTML PUBLIC \"-//IETF//DTD HTML 2.0//EN\">\r\n"
-		 "<HTML><HEAD>\r\n"
-		 "<TITLE>%d %s</TITLE>\r\n"
-		 "</HEAD><BODY>\r\n"
-		 "<H1>%d %s</H1>\r\n",
-		 error, errtxt, error, errtxt);
+    htsbuf_qprintf(&hc->hc_reply,
+                   "<!DOCTYPE HTML PUBLIC \"-//IETF//DTD HTML 2.0//EN\">\r\n"
+                   "<HTML><HEAD>\r\n"
+                   "<TITLE>%d %s</TITLE>\r\n"
+                   "</HEAD><BODY>\r\n"
+                   "<H1>%d %s</H1>\r\n",
+                   error, errtxt, error, errtxt);
 
-  if (error == HTTP_STATUS_UNAUTHORIZED)
-    htsbuf_qprintf(&hc->hc_reply, "<P><A HREF=\"/\">Default Login</A></P>");
+    if (error == HTTP_STATUS_UNAUTHORIZED)
+      htsbuf_qprintf(&hc->hc_reply, "<P><A HREF=\"/\">Default Login</A></P>");
 
-  htsbuf_qprintf(&hc->hc_reply, "</BODY></HTML>\r\n");
+    htsbuf_qprintf(&hc->hc_reply, "</BODY></HTML>\r\n");
 
-  http_send_reply(hc, error, "text/html", NULL, NULL, 0);
+    http_send_reply(hc, error, "text/html", NULL, NULL, 0);
+  } else {
+    http_send_reply(hc, error, NULL, NULL, NULL, 0);
+  }
 }
 
 
@@ -419,10 +496,8 @@ http_access_verify_ticket(http_connection_t *hc)
   hc->hc_access = access_ticket_verify2(ticket_id, hc->hc_url);
   if (hc->hc_access == NULL)
     return;
-  char addrstr[50];
-  tcp_get_ip_str((struct sockaddr*)hc->hc_peer, addrstr, 50);
-  tvhlog(LOG_INFO, "HTTP", "%s: using ticket %s for %s",
-	 addrstr, ticket_id, hc->hc_url);
+  tvhlog(LOG_INFO, "http", "%s: using ticket %s for %s",
+	 hc->hc_peer_ipstr, ticket_id, hc->hc_url);
 }
 
 /**
@@ -507,22 +582,24 @@ dump_request(http_connection_t *hc)
 {
   char buf[2048] = "";
   http_arg_t *ra;
-  int first;
+  int first, ptr = 0;
 
   first = 1;
   TAILQ_FOREACH(ra, &hc->hc_req_args, link) {
-    snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), first ? "?%s=%s" : "&%s=%s", ra->key, ra->val);
+    tvh_strlcatf(buf, sizeof(buf), ptr, first ? "?%s=%s" : "&%s=%s", ra->key, ra->val);
     first = 0;
   }
 
   first = 1;
   TAILQ_FOREACH(ra, &hc->hc_args, link) {
-    snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), first ? "{{%s=%s" : ",%s=%s", ra->key, ra->val);
+    tvh_strlcatf(buf, sizeof(buf), ptr, first ? "{{%s=%s" : ",%s=%s", ra->key, ra->val);
     first = 0;
   }
-  snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "}}");
+  if (!first)
+    tvh_strlcatf(buf, sizeof(buf), ptr, "}}");
 
-  tvhtrace("http", "%s%s", hc->hc_url, buf);
+  tvhtrace("http", "%s %s %s%s", http_ver2str(hc->hc_version),
+           http_cmd2str(hc->hc_cmd), hc->hc_url, buf);
 }
 #else
 static inline void
@@ -647,9 +724,15 @@ process_request(http_connection_t *hc, htsbuf_queue_t *spill)
 {
   char *v, *argv[2];
   int n, rval = -1;
-  uint8_t authbuf[150];
+  char authbuf[150];
 
   hc->hc_url_orig = tvh_strdupa(hc->hc_url);
+  tcp_get_ip_str((struct sockaddr*)hc->hc_peer, authbuf, sizeof(authbuf));
+  hc->hc_peer_ipstr = tvh_strdupa(authbuf);
+  hc->hc_representative = hc->hc_peer_ipstr;
+  hc->hc_username = NULL;
+  hc->hc_password = NULL;
+  hc->hc_session  = NULL;
 
   /* Set keep-alive status */
   v = http_arg_get(&hc->hc_args, "connection");
@@ -657,6 +740,20 @@ process_request(http_connection_t *hc, htsbuf_queue_t *spill)
   switch(hc->hc_version) {
   case RTSP_VERSION_1_0:
     hc->hc_keep_alive = 1;
+    /* Extract CSeq */
+    if((v = http_arg_get(&hc->hc_args, "CSeq")) != NULL)
+      hc->hc_cseq = strtoll(v, NULL, 10);
+    else
+      hc->hc_cseq = 0;
+    free(hc->hc_session);
+    if ((v = http_arg_get(&hc->hc_args, "Session")) != NULL)
+      hc->hc_session = tvh_strdupa(v);
+    else
+      hc->hc_session = NULL;
+    if(hc->hc_cseq == 0) {
+      http_error(hc, HTTP_STATUS_BAD_REQUEST);
+      return -1;
+    }
     break;
 
   case HTTP_VERSION_1_0:
@@ -673,36 +770,38 @@ process_request(http_connection_t *hc, htsbuf_queue_t *spill)
   /* Extract authorization */
   if((v = http_arg_get(&hc->hc_args, "Authorization")) != NULL) {
     if((n = http_tokenize(v, argv, 2, -1)) == 2) {
-      n = base64_decode(authbuf, argv[1], sizeof(authbuf) - 1);
+      n = base64_decode((uint8_t *)authbuf, argv[1], sizeof(authbuf) - 1);
       if (n < 0)
         n = 0;
       authbuf[n] = 0;
-      if((n = http_tokenize((char *)authbuf, argv, 2, ':')) == 2) {
-	      hc->hc_username = strdup(argv[0]);
-	      hc->hc_password = strdup(argv[1]);
+      if((n = http_tokenize(authbuf, argv, 2, ':')) == 2) {
+        hc->hc_username = tvh_strdupa(argv[0]);
+        hc->hc_password = tvh_strdupa(argv[1]);
         // No way to actually track this
       }
     }
   }
 
-  if(hc->hc_username != NULL) {
-    hc->hc_representative = strdup(hc->hc_username);
-  } else {
-    hc->hc_representative = malloc(50);
-    /* Not threadsafe ? */
-    tcp_get_ip_str((struct sockaddr*)hc->hc_peer, hc->hc_representative, 50);
-  }
+  if (hc->hc_username)
+    hc->hc_representative = hc->hc_username;
 
   switch(hc->hc_version) {
   case RTSP_VERSION_1_0:
+    dump_request(hc);
+    if (hc->hc_cseq)
+      rval = hc->hc_process(hc, spill);
+    else
+      http_error(hc, HTTP_STATUS_HTTP_VERSION);
     break;
 
   case HTTP_VERSION_1_0:
   case HTTP_VERSION_1_1:
-    rval = http_process_request(hc, spill);
+    if (!hc->hc_cseq)
+      rval = hc->hc_process(hc, spill);
+    else
+      http_error(hc, HTTP_STATUS_HTTP_VERSION);
     break;
   }
-  free(hc->hc_representative);
   return rval;
 }
 
@@ -735,6 +834,28 @@ http_arg_get(struct http_arg_list *list, const char *name)
     if(!strcasecmp(ra->key, name))
       return ra->val;
   return NULL;
+}
+
+/**
+ * Find an argument associated with a connection and remove it
+ */
+char *
+http_arg_get_remove(struct http_arg_list *list, const char *name)
+{
+  static char __thread buf[128];
+  http_arg_t *ra;
+  TAILQ_FOREACH(ra, list, link)
+    if(!strcasecmp(ra->key, name)) {
+      TAILQ_REMOVE(list, ra, link);
+      strncpy(buf, ra->val, sizeof(buf)-1);
+      buf[sizeof(buf)-1] = '\0';
+      free(ra->key);
+      free(ra->val);
+      free(ra);
+      return buf;
+    }
+  buf[0] = '\0';
+  return buf;
 }
 
 
@@ -871,11 +992,13 @@ http_deescape(char *s)
 /**
  * Parse arguments of a HTTP GET url, not perfect, but works for us
  */
-static void
+void
 http_parse_get_args(http_connection_t *hc, char *args)
 {
   char *k, *v;
 
+  if (args && *args == '&')
+    args++;
   while(args) {
     k = args;
     if((args = strchr(args, '=')) == NULL)
@@ -897,12 +1020,16 @@ http_parse_get_args(http_connection_t *hc, char *args)
 /**
  *
  */
-static void
-http_serve_requests(http_connection_t *hc, htsbuf_queue_t *spill)
+void
+http_serve_requests(http_connection_t *hc)
 {
+  htsbuf_queue_t spill;
   char *argv[3], *c, *cmdline = NULL, *hdrline = NULL;
-  int n;
+  int n, r;
 
+  http_arg_init(&hc->hc_args);
+  http_arg_init(&hc->hc_req_args);
+  htsbuf_queue_init(&spill, 0);
   htsbuf_queue_init(&hc->hc_reply, 0);
 
   do {
@@ -910,7 +1037,7 @@ http_serve_requests(http_connection_t *hc, htsbuf_queue_t *spill)
 
     if (cmdline) free(cmdline);
 
-    if ((cmdline = tcp_read_line(hc->hc_fd, spill)) == NULL)
+    if ((cmdline = tcp_read_line(hc->hc_fd, &spill)) == NULL)
       goto error;
 
     if((n = http_tokenize(cmdline, argv, 3, -1)) != 3)
@@ -927,24 +1054,28 @@ http_serve_requests(http_connection_t *hc, htsbuf_queue_t *spill)
     while(1) {
       if (hdrline) free(hdrline);
 
-      if ((hdrline = tcp_read_line(hc->hc_fd, spill)) == NULL)
+      if ((hdrline = tcp_read_line(hc->hc_fd, &spill)) == NULL)
         goto error;
 
       if(!*hdrline)
-	      break; /* header complete */
+        break; /* header complete */
 
-      if((n = http_tokenize(hdrline, argv, 2, -1)) < 2)
-	      continue;
-
-      if((c = strrchr(argv[0], ':')) == NULL)
-	      goto error;
+      if((n = http_tokenize(hdrline, argv, 2, -1)) < 2) {
+        if ((c = strchr(hdrline, ':')) != NULL) {
+          *c = '\0';
+          argv[0] = hdrline;
+          argv[1] = c + 1;
+        } else {
+          continue;
+        }
+      } else if((c = strrchr(argv[0], ':')) == NULL)
+        goto error;
 
       *c = 0;
       http_arg_set(&hc->hc_args, argv[0], argv[1]);
     }
 
-    if(process_request(hc, spill))
-      break;
+    r = process_request(hc, &spill);
 
     free(hc->hc_post_data);
     hc->hc_post_data = NULL;
@@ -954,11 +1085,8 @@ http_serve_requests(http_connection_t *hc, htsbuf_queue_t *spill)
 
     htsbuf_queue_flush(&hc->hc_reply);
 
-    free(hc->hc_username);
-    hc->hc_username = NULL;
-
-    free(hc->hc_password);
-    hc->hc_password = NULL;
+    if (r)
+      break;
 
     hc->hc_logout_cookie = 0;
 
@@ -977,41 +1105,29 @@ static void
 http_serve(int fd, void **opaque, struct sockaddr_storage *peer, 
 	   struct sockaddr_storage *self)
 {
-  htsbuf_queue_t spill;
   http_connection_t hc;
 
-  // Note: global_lock held on entry */
+  /* Note: global_lock held on entry */
   pthread_mutex_unlock(&global_lock);
   memset(&hc, 0, sizeof(http_connection_t));
   *opaque = &hc;
 
-  http_arg_init(&hc.hc_args);
-  http_arg_init(&hc.hc_req_args);
+  hc.hc_fd      = fd;
+  hc.hc_peer    = peer;
+  hc.hc_self    = self;
+  hc.hc_paths   = &http_paths;
+  hc.hc_process = http_process_request;
 
-  hc.hc_fd = fd;
-  hc.hc_peer = peer;
-  hc.hc_self = self;
+  http_serve_requests(&hc);
 
-  htsbuf_queue_init(&spill, 0);
-
-  http_serve_requests(&hc, &spill);
-
-  http_arg_flush(&hc.hc_args);
-  http_arg_flush(&hc.hc_req_args);
-
-  htsbuf_queue_flush(&hc.hc_reply);
-  htsbuf_queue_flush(&spill);
   close(fd);
 
   // Note: leave global_lock held for parent
   pthread_mutex_lock(&global_lock);
-  free(hc.hc_post_data);
-  free(hc.hc_username);
-  free(hc.hc_password);
   *opaque = NULL;
 }
 
-static void
+void
 http_cancel( void *opaque )
 {
   http_connection_t *hc = opaque;

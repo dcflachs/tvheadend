@@ -395,10 +395,11 @@ static int _eit_desc_crid
  * EIT Event
  * ***********************************************************************/
 
-static int _eit_process_event
+static int _eit_process_event_one
   ( epggrab_module_t *mod, int tableid,
-    mpegts_service_t *svc, const uint8_t *ptr, int len,
-    int *resched, int *save )
+    mpegts_service_t *svc, channel_t *ch,
+    const uint8_t *ptr, int len,
+    int local, int *resched, int *save )
 {
   int save2 = 0;
   int ret, dllen;
@@ -409,13 +410,12 @@ static int _eit_process_event
   epg_episode_t *ee;
   epg_serieslink_t *es;
   eit_event_t ev;
-  channel_t *ch = LIST_FIRST(&svc->s_channels)->csm_chn;
 
   if ( len < 12 ) return -1;
 
   /* Core fields */
   eid   = ptr[0] << 8 | ptr[1];
-  start = dvb_convert_date(&ptr[2]);
+  start = dvb_convert_date(&ptr[2], local);
   stop  = start + bcdtoint(ptr[7] & 0xff) * 3600 +
                   bcdtoint(ptr[8] & 0xff) * 60 +
                   bcdtoint(ptr[9] & 0xff);
@@ -446,12 +446,13 @@ static int _eit_process_event
     int r;
     dtag = ptr[0];
     dlen = ptr[1];
-    tvhtrace(mod->id, "  dtag %02X dlen %d", dtag, dlen);
-    tvhlog_hexdump(mod->id, ptr+2, dlen);
 
     dllen -= 2;
     ptr   += 2;
     if (dllen < dlen) break;
+
+    tvhtrace(mod->id, "  dtag %02X dlen %d", dtag, dlen);
+    tvhlog_hexdump(mod->id, ptr, dlen);
 
     switch (dtag) {
       case DVB_DESC_SHORT_EVENT:
@@ -531,6 +532,8 @@ static int _eit_process_event
       *save |= epg_episode_set_genre(ee, ev.genre, mod);
     if ( ev.parental )
       *save |= epg_episode_set_age_rating(ee, ev.parental, mod);
+    if ( ev.summary )
+      *save |= epg_episode_set_subtitle2(ee, ev.summary, mod);
 #if TODO_ADD_EXTRA
     if ( ev.extra )
       *save |= epg_episode_set_extra(ee, extra, mod);
@@ -549,6 +552,23 @@ static int _eit_process_event
   return ret;
 }
 
+static int _eit_process_event
+  ( epggrab_module_t *mod, int tableid,
+    mpegts_service_t *svc, const uint8_t *ptr, int len,
+    int local, int *resched, int *save )
+{
+  channel_service_mapping_t *csm;
+  int ret = 0;
+
+  if ( len < 12 ) return -1;
+
+  LIST_FOREACH(csm, &svc->s_channels, csm_svc_link)
+    ret = _eit_process_event_one(mod, tableid, svc, csm->csm_chn,
+                                 ptr, len, local, resched, save);
+  return ret;
+}
+
+
 static int
 _eit_callback
   (mpegts_table_t *mt, const uint8_t *ptr, int len, int tableid)
@@ -559,11 +579,18 @@ _eit_callback
   uint16_t onid, tsid, sid;
   uint32_t extraid;
   mpegts_service_t     *svc;
-  mpegts_mux_t         *mm  = mt->mt_mux;
-  epggrab_ota_map_t    *map = mt->mt_opaque;
-  epggrab_module_t     *mod = (epggrab_module_t *)map->om_module;
+  mpegts_mux_t         *mm;
+  epggrab_ota_map_t    *map;
+  epggrab_module_t     *mod;
   epggrab_ota_mux_t    *ota = NULL;
-  mpegts_table_state_t *st;
+  mpegts_psi_table_state_t *st;
+
+  if (!epggrab_ota_running)
+    return -1;
+
+  mm  = mt->mt_mux;
+  map = mt->mt_opaque;
+  mod = (epggrab_module_t *)map->om_module;
 
   /* Validate */
   if(tableid < 0x4e || tableid > 0x6f || len < 11)
@@ -582,7 +609,8 @@ _eit_callback
     ota = epggrab_ota_register((epggrab_module_ota_t*)mod, NULL, mm);
 
   /* Begin */
-  r = dvb_table_begin(mt, ptr, len, tableid, extraid, 11, &st, &sect, &last, &ver);
+  r = dvb_table_begin((mpegts_psi_table_t *)mt, ptr, len,
+                      tableid, extraid, 11, &st, &sect, &last, &ver);
   if (r != 1) return r;
   if (st) {
     uint32_t mask;
@@ -643,6 +671,7 @@ _eit_callback
   while (len) {
     int r;
     if ((r = _eit_process_event(mod, tableid, svc, ptr, len,
+                                mm->mm_network->mn_localtime,
                                 &resched, &save)) < 0)
       break;
     len -= r;
@@ -654,7 +683,7 @@ _eit_callback
   if (save)    epg_updated();
   
 done:
-  r = dvb_table_end(mt, st, sect);
+  r = dvb_table_end((mpegts_psi_table_t *)mt, st, sect);
   if (ota && !r)
     epggrab_ota_complete((epggrab_module_ota_t*)mod, ota);
   
@@ -683,7 +712,7 @@ static int _eit_start
 
   /* Freesat (3002/3003) */
   if (!strcmp("uk_freesat", m->id)) {
-    mpegts_table_add(dm, 0, 0, dvb_bat_callback, NULL, "bat", MT_CRC, 3002);
+    mpegts_table_add(dm, 0, 0, dvb_bat_callback, NULL, "bat", MT_CRC, 3002, MPS_WEIGHT_EIT);
     pid = 3003;
 
   /* Viasat Baltic (0x39) */
@@ -692,10 +721,10 @@ static int _eit_start
 
   /* Standard (0x12) */
   } else {
-    pid  = 0x12;
+    pid  = DVB_EIT_PID;
     opts = MT_RECORD;
   }
-  mpegts_table_add(dm, 0, 0, _eit_callback, map, m->id, MT_CRC | opts, pid);
+  mpegts_table_add(dm, 0, 0, _eit_callback, map, m->id, MT_CRC | opts, pid, MPS_WEIGHT_EIT);
   // TODO: might want to limit recording to EITpf only
   tvhlog(LOG_DEBUG, m->id, "installed table handlers");
   return 0;

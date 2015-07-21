@@ -422,6 +422,7 @@ const lang_code_t lang_codes[] = {
   { "swa", "sw", NULL , "Swahili" },
   { "swe", "sv", NULL , "Swedish" },
   { "syc", NULL, NULL , "Classical Syriac" },
+  { "syn", NULL, NULL , "Narration: (sync audio described)"},
   { "syr", NULL, NULL , "Syriac" },
   { "tah", "ty", NULL , "Tahitian" },
   { "tai", NULL, NULL , "Tai languages" },
@@ -679,6 +680,20 @@ static void lang_code_free( lang_code_lookup_t *l )
     free(element);
   }
   free(l);
+}
+
+const char *lang_code_preferred( void )
+{
+  const char *codes = config_get_language(), *ret = "und";
+  const lang_code_t *co;
+
+  if (codes) {
+    co = lang_code_get3(codes);
+    if (co && co->code2b)
+      ret = co->code2b;
+  }
+
+  return ret;
 }
 
 void lang_code_done( void )

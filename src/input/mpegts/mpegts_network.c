@@ -176,17 +176,39 @@ const idclass_t mpegts_network_class =
     },
     {
       .type     = PT_BOOL,
+      .id       = "sid_chnum",
+      .name     = "Service IDs as Channel Numbers",
+      .off      = offsetof(mpegts_network_t, mn_sid_chnum),
+      .def.i    = 0,
+    },
+    {
+      .type     = PT_BOOL,
       .id       = "ignore_chnum",
       .name     = "Ignore Provider's Channel Numbers",
       .off      = offsetof(mpegts_network_t, mn_ignore_chnum),
       .def.i    = 0,
     },
+#if ENABLE_SATIP_SERVER
+    {
+      .type     = PT_U16,
+      .id       = "satip_source",
+      .name     = "SAT>IP Source Number",
+      .off      = offsetof(mpegts_network_t, mn_satip_source),
+    },
+#endif
     {
       .type     = PT_STR,
       .id       = "charset",
       .name     = "Character Set",
       .off      = offsetof(mpegts_network_t, mn_charset),
       .list     = dvb_charset_enum,
+      .opts     = PO_ADVANCED,
+    },
+    {
+      .type     = PT_BOOL,
+      .id       = "localtime",
+      .name     = "EIT Local Time",
+      .off      = offsetof(mpegts_network_t, mn_localtime),
       .opts     = PO_ADVANCED,
     },
     {
@@ -241,7 +263,8 @@ mpegts_network_config_save
 
 static mpegts_mux_t *
 mpegts_network_create_mux
-  ( mpegts_mux_t *mm, uint16_t sid, uint16_t tsid, void *aux )
+  ( mpegts_network_t *mn, void *origin, uint16_t sid, uint16_t tsid,
+    void *aux, int force )
 {
   return NULL;
 }
@@ -271,7 +294,7 @@ mpegts_network_mux_create2
 static void
 mpegts_network_link_delete ( mpegts_network_link_t *mnl )
 {
-  idnode_notify_simple(&mnl->mnl_input->ti_id);
+  idnode_notify_changed(&mnl->mnl_input->ti_id);
   LIST_REMOVE(mnl, mnl_mn_link);
   LIST_REMOVE(mnl, mnl_mi_link);
   free(mnl);
@@ -343,6 +366,9 @@ mpegts_network_create0
   TAILQ_INIT(&mn->mn_scan_active);
   gtimer_arm(&mn->mn_scan_timer, mpegts_network_scan_timer_cb, mn, 0);
 
+  /* Defaults */
+  mn->mn_satpos = INT_MAX;
+
   /* Load config */
   if (conf)
     idnode_load(&mn->mn_id, conf);
@@ -392,6 +418,14 @@ mpegts_network_set_network_name
   mn->mn_display_name(mn, buf, sizeof(buf));
   tvhdebug("mpegts", "%s - set name %s", buf, name);
   return 1;
+}
+
+void
+mpegts_network_scan ( mpegts_network_t *mn )
+{
+  mpegts_mux_t *mm;
+  LIST_FOREACH(mm, &mn->mn_muxes, mm_network_link)
+    mpegts_mux_scan_state_set(mm, MM_SCAN_STATE_PEND);
 }
 
 /******************************************************************************

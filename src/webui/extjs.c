@@ -47,16 +47,41 @@
 #include "timeshift.h"
 #include "tvhtime.h"
 #include "input.h"
+#include "satip/server.h"
+
+#define EXTJSPATH "static/extjs"
 
 /**
  *
  */
 static void
-extjs_load(htsbuf_queue_t *hq, const char *script)
+extjs_load(htsbuf_queue_t *hq, const char *script, ...)
 {
-  htsbuf_qprintf(hq,
-                 "<script type=\"text/javascript\" "
-		             "src=\"%s\"></script>\n", script);
+  va_list ap;
+  htsbuf_qprintf(hq, "<script type=\"text/javascript\" src=\"");
+
+  va_start(ap, script);
+  htsbuf_vqprintf(hq, script, ap);
+  va_end(ap);
+
+  htsbuf_qprintf(hq, "\"></script>\n");
+}
+
+/**
+ *
+ */
+static void
+extjs_lcss(htsbuf_queue_t *hq, const char *css, ...)
+{
+  va_list ap;
+
+  htsbuf_qprintf(hq, "<link rel=\"stylesheet\" type=\"text/css\" href=\"");
+
+  va_start(ap, css);
+  htsbuf_vqprintf(hq, css, ap);
+  va_end(ap);
+
+  htsbuf_qprintf(hq, "\"/>\n");
 }
 
 /**
@@ -67,105 +92,42 @@ extjs_exec(htsbuf_queue_t *hq, const char *fmt, ...)
 {
   va_list ap;
 
-  htsbuf_qprintf(hq, "<script type=\"text/javascript\">\r\n");
+  htsbuf_qprintf(hq, "<script type=\"text/javascript\">\n");
 
   va_start(ap, fmt);
   htsbuf_vqprintf(hq, fmt, ap);
   va_end(ap);
 
-  htsbuf_qprintf(hq, "\r\n</script>\r\n");
+  htsbuf_qprintf(hq, "\n</script>\n");
 }
 
 /**
- * PVR info, deliver info about the given PVR entry
+ * EXTJS root page
  */
 static int
 extjs_root(http_connection_t *hc, const char *remain, void *opaque)
 {
   htsbuf_queue_t *hq = &hc->hc_reply;
 
-#define EXTJSPATH "static/extjs"
   htsbuf_qprintf(hq, "<html>\n");
   htsbuf_qprintf(hq, "<head>\n");
 
   htsbuf_qprintf(hq, "<meta name=\"apple-itunes-app\" content=\"app-id=638900112\">\n");
+
+  if (tvheadend_webui_debug) {
   
-  htsbuf_qprintf(hq, "<script type=\"text/javascript\" src=\""EXTJSPATH"/adapter/ext/ext-base%s.js\"></script>\n"
-                     "<script type=\"text/javascript\" src=\""EXTJSPATH"/ext-all%s.js\"></script>\n"
-                     "<link rel=\"stylesheet\" type=\"text/css\" href=\""EXTJSPATH"/resources/css/ext-all-notheme%s.css\">\n"
-                     "<link rel=\"stylesheet\" type=\"text/css\" href=\""EXTJSPATH"/resources/css/xtheme-blue.css\">\n"
-                     "<link rel=\"stylesheet\" type=\"text/css\" href=\"static/livegrid/resources/css/ext-ux-livegrid.css\">\n"
-                     "<link rel=\"stylesheet\" type=\"text/css\" href=\"static/extjs/examples/ux/gridfilters/css/GridFilters.css\">\n"
-                     "<link rel=\"stylesheet\" type=\"text/css\" href=\"static/extjs/examples/ux/gridfilters/css/RangeMenu.css\">\n"
-                     "<link rel=\"stylesheet\" type=\"text/css\" href=\"static/xcheckbox/xcheckbox.css\">\n"
-                     "<link rel=\"stylesheet\" type=\"text/css\" href=\"static/app/ext.css\">\n",
-                     tvheadend_webui_debug ? "-debug" : "",
-                     tvheadend_webui_debug ? "-debug" : "",
-                     "");//tvheadend_webui_debug ? ""       : "-min");
-  
-  extjs_exec(hq, "Ext.BLANK_IMAGE_URL = " "'"EXTJSPATH"/resources/images/default/s.gif';");
+#include "extjs-debug.c"
 
-  /**
-   * Load extjs extensions
-   */
-  extjs_load(hq, "static/app/extensions.js");
-  extjs_load(hq, "static/livegrid/livegrid-all.js");
-  extjs_load(hq, "static/lovcombo/lovcombo-all.js");
-  extjs_load(hq, "static/multiselect/multiselect.js");
-  extjs_load(hq, "static/multiselect/ddview.js");
-  extjs_load(hq, "static/xcheckbox/xcheckbox.js");
-  extjs_load(hq, "static/checkcolumn/CheckColumn.js");
-  extjs_load(hq, "static/extjs/examples/ux/gridfilters/GridFilters.js");
-  extjs_load(hq, "static/extjs/examples/ux/gridfilters/filter/Filter.js");
-  extjs_load(hq, "static/extjs/examples/ux/gridfilters/filter/BooleanFilter.js");
-  extjs_load(hq, "static/extjs/examples/ux/gridfilters/filter/DateFilter.js");
-  extjs_load(hq, "static/extjs/examples/ux/gridfilters/filter/ListFilter.js");
-  extjs_load(hq, "static/extjs/examples/ux/gridfilters/filter/NumericFilter.js");
-  extjs_load(hq, "static/extjs/examples/ux/gridfilters/filter/StringFilter.js");
-  extjs_load(hq, "static/extjs/examples/ux/gridfilters/menu/ListMenu.js");
-  extjs_load(hq, "static/extjs/examples/ux/gridfilters/menu/RangeMenu.js");
+  } else {
 
-  /**
-   * Create a namespace for our app
-   */
-  extjs_exec(hq, "Ext.namespace('tvheadend');");
+#include "extjs-std.c"
 
-  /**
-   * Load all components
-   */
-  extjs_load(hq, "static/app/comet.js");
-  extjs_load(hq, "static/app/tableeditor.js");
-  extjs_load(hq, "static/app/cteditor.js");
-  extjs_load(hq, "static/app/acleditor.js");
-#if ENABLE_CWC || ENABLE_CAPMT
-  extjs_load(hq, "static/app/caclient.js");
-#endif
-  extjs_load(hq, "static/app/tvadapters.js");
-  extjs_load(hq, "static/app/idnode.js");
-  extjs_load(hq, "static/app/esfilter.js");
-#if ENABLE_MPEGTS
-  extjs_load(hq, "static/app/mpegts.js");
-#endif
-#if ENABLE_TIMESHIFT
-  extjs_load(hq, "static/app/timeshift.js");
-#endif
-  extjs_load(hq, "static/app/chconf.js");
-  extjs_load(hq, "static/app/epg.js");
-  extjs_load(hq, "static/app/dvr.js");
-  extjs_load(hq, "static/app/epggrab.js");
-  extjs_load(hq, "static/app/config.js");
-  extjs_load(hq, "static/app/tvhlog.js");
-  extjs_load(hq, "static/app/status.js");
-  extjs_load(hq, "static/tv.js");
-  extjs_load(hq, "static/app/servicemapper.js");
+  }
 
-  /**
-   * Finally, the app itself
-   */
-  extjs_load(hq, "static/app/tvheadend.js");
-  extjs_exec(hq, "Ext.onReady(tvheadend.app.init, tvheadend.app);");
-  
-
+  extjs_exec(hq, "\
+Ext.BLANK_IMAGE_URL = \'" EXTJSPATH "/resources/images/default/s.gif';\r\n\
+Ext.onReady(tvheadend.app.init, tvheadend.app);\
+");
 
 
   htsbuf_qprintf(hq,
@@ -191,6 +153,7 @@ extjs_root(http_connection_t *hc, const char *remain, void *opaque)
 		 "<div id=\"systemlog\"></div>\n"
 		 "</body></html>\n",
 		 tvheadend_version);
+
   http_output_html(hc);
   return 0;
 }
@@ -208,17 +171,17 @@ extjs_livetv(http_connection_t *hc, const char *remain, void *opaque)
   htsbuf_qprintf(hq, "<html>\n");
   htsbuf_qprintf(hq, "<head>\n");
   htsbuf_qprintf(hq, "<title>HTS Tvheadend %s</title>\n", tvheadend_version);
-  htsbuf_qprintf(hq, "<link rel=\"stylesheet\" type=\"text/css\" href=\"static/tv.css\">\n");
 
-  if(tvheadend_webui_debug) {
-    extjs_load(hq, "static/extjs/adapter/ext/ext-base-debug.js");
-    extjs_load(hq, "static/extjs/ext-all-debug.js");
+  if (tvheadend_webui_debug) {
+
+#include "extjs-tv-debug.c"
+
   } else {
-    extjs_load(hq, "static/extjs/adapter/ext/ext-base.js");
-    extjs_load(hq, "static/extjs/ext-all.js");
+
+#include "extjs-tv-std.c"
+
   }
 
-  extjs_load(hq, "static/tv.js");
   extjs_exec(hq, "Ext.onReady(tv.app.init, tv.app);");
 
   htsbuf_qprintf(hq, "</head>\n");
@@ -244,7 +207,7 @@ page_about(http_connection_t *hc, const char *remain, void *opaque)
 		 "<div class=\"about-title\">"
 		 "HTS Tvheadend %s"
 		 "</div><br>"
-		 "&copy; 2006 - 2014 Andreas \303\226man, et al.<br><br>"
+		 "&copy; 2006 - 2015 Andreas \303\226man, et al.<br><br>"
 		 "<img src=\"docresources/tvheadendlogo.png\"><br>"
 		 "<a href=\"https://tvheadend.org\">"
 		 "https://tvheadend.org</a><br><br>"
@@ -381,6 +344,19 @@ extjs_epggrab(http_connection_t *hc, const char *remain, void *opaque)
     out = htsmsg_create_map();
     htsmsg_add_u32(out, "success", 1);
 
+  /* OTA EPG trigger */
+  } else if (!strcmp(op, "otaepgTrigger") ) {
+
+    str = http_arg_get(&hc->hc_req_args, "after");
+    if (!str)
+      return HTTP_STATUS_BAD_REQUEST;
+
+    pthread_mutex_lock(&global_lock);
+    epggrab_ota_trigger(atoi(str));
+    pthread_mutex_unlock(&global_lock);
+    out = htsmsg_create_map();
+    htsmsg_add_u32(out, "success", 1);
+
   } else {
     return HTTP_STATUS_BAD_REQUEST;
   }
@@ -497,7 +473,7 @@ extjs_config(http_connection_t *hc, const char *remain, void *opaque)
 
   /* Save settings */
   } else if (!strcmp(op, "saveSettings") ) {
-    int save = 0;
+    int save = 0, ssave = 0;
 
     /* Misc settings */
     pthread_mutex_lock(&global_lock);
@@ -511,14 +487,40 @@ extjs_config(http_connection_t *hc, const char *remain, void *opaque)
       save |= config_set_chicon_path(str);
     if ((str = http_arg_get(&hc->hc_req_args, "piconpath")))
       save |= config_set_picon_path(str);
-    if (save)
+    if ((str = http_arg_get(&hc->hc_req_args, "satip_rtsp")))
+      ssave |= config_set_int("satip_rtsp", atoi(str));
+    if ((str = http_arg_get(&hc->hc_req_args, "satip_weight")))
+      ssave |= config_set_int("satip_weight", atoi(str));
+    if ((str = http_arg_get(&hc->hc_req_args, "satip_descramble")))
+      ssave |= config_set_int("satip_descramble", atoi(str));
+    if ((str = http_arg_get(&hc->hc_req_args, "satip_muxcnf")))
+      ssave |= config_set_int("satip_muxcnf", atoi(str));
+    if ((str = http_arg_get(&hc->hc_req_args, "satip_dvbs")))
+      ssave |= config_set_int("satip_dvbs", atoi(str));
+    if ((str = http_arg_get(&hc->hc_req_args, "satip_dvbs2")))
+      ssave |= config_set_int("satip_dvbs2", atoi(str));
+    if ((str = http_arg_get(&hc->hc_req_args, "satip_dvbt")))
+      ssave |= config_set_int("satip_dvbt", atoi(str));
+    if ((str = http_arg_get(&hc->hc_req_args, "satip_dvbt2")))
+      ssave |= config_set_int("satip_dvbt2", atoi(str));
+    if ((str = http_arg_get(&hc->hc_req_args, "satip_dvbc")))
+      ssave |= config_set_int("satip_dvbc", atoi(str));
+    if ((str = http_arg_get(&hc->hc_req_args, "satip_dvbc2")))
+      ssave |= config_set_int("satip_dvbc2", atoi(str));
+    if ((str = http_arg_get(&hc->hc_req_args, "satip_atsc")))
+      ssave |= config_set_int("satip_atsc", atoi(str));
+    if ((str = http_arg_get(&hc->hc_req_args, "satip_dvbcb")))
+      ssave |= config_set_int("satip_dvbcb", atoi(str));
+    if (save | ssave)
       config_save();
+    if (ssave)
+      satip_server_config_changed();
 
     /* Time */
     str = http_arg_get(&hc->hc_req_args, "tvhtime_update_enabled");
-    tvhtime_set_update_enabled(!!str);
+    tvhtime_set_update_enabled(bool_check(str));
     str = http_arg_get(&hc->hc_req_args, "tvhtime_ntp_enabled");
-    tvhtime_set_ntp_enabled(!!str);
+    tvhtime_set_ntp_enabled(bool_check(str));
     if ((str = http_arg_get(&hc->hc_req_args, "tvhtime_tolerance")))
       tvhtime_set_tolerance(atoi(str));
 
@@ -677,6 +679,8 @@ extjs_timeshift(http_connection_t *hc, const char *remain, void *opaque)
     htsmsg_add_u32(m, "timeshift_max_period", timeshift_max_period / 60);
     htsmsg_add_u32(m, "timeshift_unlimited_size", timeshift_unlimited_size);
     htsmsg_add_u32(m, "timeshift_max_size", timeshift_max_size / 1048576);
+    htsmsg_add_u32(m, "timeshift_ram_size", timeshift_ram_size / 1048576);
+    htsmsg_add_u32(m, "timeshift_ram_only", timeshift_ram_only);
     pthread_mutex_unlock(&global_lock);
     out = json_single_record(m, "config");
 
@@ -696,6 +700,11 @@ extjs_timeshift(http_connection_t *hc, const char *remain, void *opaque)
     timeshift_unlimited_size = http_arg_get(&hc->hc_req_args, "timeshift_unlimited_size") ? 1 : 0;
     if ((str = http_arg_get(&hc->hc_req_args, "timeshift_max_size")))
       timeshift_max_size   = atol(str) * 1048576LL;
+    if ((str = http_arg_get(&hc->hc_req_args, "timeshift_ram_size"))) {
+      timeshift_ram_size         = atol(str) * 1048576LL;
+      timeshift_ram_segment_size = timeshift_ram_size / 10;
+    }
+    timeshift_ram_only = http_arg_get(&hc->hc_req_args, "timeshift_ram_only") ? 1 : 0;
     timeshift_save();
     pthread_mutex_unlock(&global_lock);
 
@@ -731,8 +740,4 @@ extjs_start(void)
   http_path_add("/timeshift",        NULL, extjs_timeshift,        ACCESS_ADMIN);
 #endif
   http_path_add("/tvhlog",           NULL, extjs_tvhlog,           ACCESS_ADMIN);
-
-#if ENABLE_V4L
-  extjs_start_v4l();
-#endif
 }

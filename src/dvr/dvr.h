@@ -63,19 +63,7 @@ typedef struct dvr_config {
   int dvr_skip_commercials;
   int dvr_subtitle_in_title;
   int dvr_episode_before_date;
-  int dvr_episode_duplicate;
   int dvr_windows_compatible_filenames;
-
-  /* Series link support */
-  int dvr_sl_brand_lock;
-  int dvr_sl_season_lock;
-  int dvr_sl_channel_lock;
-  int dvr_sl_time_lock;
-  int dvr_sl_more_recent;
-  int dvr_sl_quality_lock;
-
-  /* Duplicate detect */
-  int dvr_dup_detect_episode;
 
   struct dvr_entry_list dvr_entries;
   struct dvr_autorec_entry_list dvr_autorec_entries;
@@ -163,6 +151,7 @@ typedef struct dvr_entry {
   char *de_directory; /* Can be set for autorec entries, will override any 
                          directory setting from the configuration */
   lang_str_t *de_title;      /* Title in UTF-8 (from EPG) */
+  lang_str_t *de_subtitle;   /* Subtitle in UTF-8 (from EPG) */
   lang_str_t *de_desc;       /* Description in UTF-8 (from EPG) */
   uint32_t de_content_type;  /* Content type (from EPG) (only code) */
 
@@ -193,6 +182,11 @@ typedef struct dvr_entry {
    * Number of errors (only to be modified by the recording thread)
    */
   uint32_t de_errors;
+
+  /**
+   * Number of data errors (only to be modified by the recording thread)
+   */
+  uint32_t de_data_errors;
 
   /**
    * Last error, see SM_CODE_ defines
@@ -230,9 +224,24 @@ typedef struct dvr_entry {
   LIST_ENTRY(dvr_entry) de_inotify_link;
 #endif
 
+  /**
+   * Entry change notification timer
+   */
+  time_t de_last_notify;
+
 } dvr_entry_t;
 
 #define DVR_CH_NAME(e) ((e)->de_channel == NULL ? (e)->de_channel_name : channel_get_name((e)->de_channel))
+
+typedef enum {
+  DVR_AUTOREC_RECORD_ALL = 0,
+  DVR_AUTOREC_RECORD_DIFFERENT_EPISODE_NUMBER = 1,
+  DVR_AUTOREC_RECORD_DIFFERENT_SUBTITLE = 2,
+  DVR_AUTOREC_RECORD_DIFFERENT_DESCRIPTION = 3,
+  DVR_AUTOREC_RECORD_ONCE_PER_WEEK = 4,
+  DVR_AUTOREC_RECORD_ONCE_PER_DAY = 5
+} dvr_autorec_dedup_t;
+
 
 /**
  * Autorec entry
@@ -254,6 +263,7 @@ typedef struct dvr_autorec_entry {
 
   char *dae_title;
   regex_t dae_title_preg;
+  int dae_fulltext;
   
   uint32_t dae_content_type;
 
@@ -283,6 +293,9 @@ typedef struct dvr_autorec_entry {
 
   time_t dae_start_extra;
   time_t dae_stop_extra;
+  
+  int dae_record;
+  
 } dvr_autorec_entry_t;
 
 TAILQ_HEAD(dvr_autorec_entry_queue, dvr_autorec_entry);
@@ -421,7 +434,8 @@ dvr_entry_t *
 dvr_entry_create_htsp( const char *dvr_config_uuid,
                        channel_t *ch, time_t start, time_t stop,
                        time_t start_extra, time_t stop_extra,
-                       const char *title, const char *description,
+                       const char *title, const char *subtitle,
+                       const char *description,
                        const char *lang, epg_genre_t *content_type,
                        const char *owner, const char *creator,
                        dvr_autorec_entry_t *dae,
@@ -430,9 +444,10 @@ dvr_entry_create_htsp( const char *dvr_config_uuid,
 
 dvr_entry_t *
 dvr_entry_update( dvr_entry_t *de,
-                  const char* de_title, const char *de_desc, const char *lang,
-                  time_t de_start, time_t de_stop,
-                  time_t de_start_extra, time_t de_stop_extra,
+                  const char *title, const char *subtitle,
+                  const char *desc, const char *lang,
+                  time_t start, time_t stop,
+                  time_t start_extra, time_t stop_extra,
                   dvr_prio_t pri, int retention );
 
 void dvr_destroy_by_channel(channel_t *ch, int delconf);
@@ -471,6 +486,19 @@ htsmsg_t *dvr_entry_class_pri_list(void *o);
 htsmsg_t *dvr_entry_class_config_name_list(void *o);
 htsmsg_t *dvr_entry_class_duration_list(void *o, const char *not_set, int max, int step);
 
+static inline int dvr_entry_verify(dvr_entry_t *de, access_t *a, int readonly)
+{
+  if (readonly && !access_verify2(a, ACCESS_ALL_RECORDER))
+    return 0;
+
+  if (!access_verify2(a, ACCESS_ALL_RW_RECORDER))
+    return 0;
+
+  if (strcmp(de->de_owner ?: "", a->aa_username ?: ""))
+    return -1;
+  return 0;
+}
+
 /**
  *
  */
@@ -482,18 +510,18 @@ dvr_entry_t *
 dvr_entry_create_(const char *config_uuid, epg_broadcast_t *e,
                   channel_t *ch, time_t start, time_t stop,
                   time_t start_extra, time_t stop_extra,
-                  const char *title, const char *description,
+                  const char *title, const char* subtitle, const char *description,
                   const char *lang, epg_genre_t *content_type,
                   const char *owner, const char *creator,
                   dvr_autorec_entry_t *dae, dvr_timerec_entry_t *tae,
                   dvr_prio_t pri, int retention, const char *comment);
 
 dvr_autorec_entry_t *
-dvr_autorec_create_htsp(const char *dvr_config_name, const char *title,
+dvr_autorec_create_htsp(const char *dvr_config_name, const char *title, int fulltext,
                             channel_t *ch, uint32_t enabled, int32_t start,
                             int32_t start_window, uint32_t days, time_t start_extra,
                             time_t stop_extra, dvr_prio_t pri, int retention,
-                            int min_duration, int max_duration,
+                            int min_duration, int max_duration, dvr_autorec_dedup_t dup_detect,
                             const char *owner, const char *creator,
                             const char *comment, const char *name, const char *directory);
 
@@ -536,6 +564,24 @@ void dvr_autorec_done(void);
 
 void dvr_autorec_update(void);
 
+static inline int
+  dvr_autorec_entry_verify(dvr_autorec_entry_t *dae, access_t *a, int readonly)
+{
+  if (readonly && !access_verify2(a, ACCESS_ALL_RECORDER))
+    return 0;
+  if (!access_verify2(a, ACCESS_ALL_RW_RECORDER))
+    return 0;
+  if (strcmp(dae->dae_owner ?: "", a->aa_username ?: ""))
+    return -1;
+  return 0;
+}
+
+int dvr_autorec_get_retention( dvr_autorec_entry_t *dae );
+
+int dvr_autorec_get_extra_time_post( dvr_autorec_entry_t *dae );
+
+int dvr_autorec_get_extra_time_pre( dvr_autorec_entry_t *dae );
+
 /**
  *
  */
@@ -570,6 +616,20 @@ void dvr_timerec_init(void);
 void dvr_timerec_done(void);
 
 void dvr_timerec_update(void);
+
+static inline int dvr_timerec_entry_verify
+  (dvr_timerec_entry_t *dte, access_t *a, int readonly)
+{
+  if (readonly && !access_verify2(a, ACCESS_ALL_RECORDER))
+    return 0;
+  if (!access_verify2(a, ACCESS_ALL_RW_RECORDER))
+    return 0;
+  if (strcmp(dte->dte_owner ?: "", a->aa_username ?: ""))
+    return -1;
+  return 0;
+}
+
+int dvr_timerec_get_retention( dvr_timerec_entry_t *dte );
 
 /**
  *

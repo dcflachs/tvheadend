@@ -155,7 +155,7 @@ dvr_timerec_check(dvr_timerec_entry_t *dte)
            dte->dte_creator ?: "");
   de = dvr_entry_create_(idnode_uuid_as_str(&dte->dte_config->dvr_id),
                          NULL, dte->dte_channel,
-                         start, stop, 0, 0, title,
+                         start, stop, 0, 0, title, NULL,
                          NULL, NULL, NULL, dte->dte_owner, buf,
                          NULL, dte, dte->dte_pri, dte->dte_retention,
                          dte->dte_comment);
@@ -183,7 +183,7 @@ dvr_timerec_create(const char *uuid, htsmsg_t *conf)
     return NULL;
   }
 
-  dte->dte_title = strdup("Time-%x-%R");
+  dte->dte_title = strdup("Time-%F_%R");
   dte->dte_weekdays = 0x7f;
   dte->dte_pri = DVR_PRIO_NORMAL;
   dte->dte_start = -1;
@@ -240,7 +240,10 @@ dvr_timerec_create_htsp(const char *dvr_config_name, const char *title,
   htsmsg_destroy(conf);
 
   if (dte)
+  {
     dvr_timerec_save(dte);
+    dvr_timerec_check(dte);
+  }
 
   return dte;
 }
@@ -266,6 +269,7 @@ timerec_entry_destroy(dvr_timerec_entry_t *dte, int delconf)
 
   free(dte->dte_name);
   free(dte->dte_title);
+  free(dte->dte_directory);
   free(dte->dte_owner);
   free(dte->dte_creator);
   free(dte->dte_comment);
@@ -308,6 +312,20 @@ static void
 dvr_timerec_entry_class_delete(idnode_t *self)
 {
   timerec_entry_destroy((dvr_timerec_entry_t *)self, 1);
+}
+
+static int
+dvr_timerec_entry_class_perm(idnode_t *self, access_t *a, htsmsg_t *msg_to_write)
+{
+  dvr_timerec_entry_t *dte = (dvr_timerec_entry_t *)self;
+
+  if (access_verify2(a, ACCESS_OR|ACCESS_ADMIN|ACCESS_RECORDER))
+    return -1;
+  if (!access_verify2(a, ACCESS_ADMIN))
+    return 0;
+  if (dvr_timerec_entry_verify(dte, a, msg_to_write == NULL ? 1 : 0))
+    return -1;
+  return 0;
 }
 
 static const char *
@@ -521,6 +539,7 @@ const idclass_t dvr_timerec_entry_class = {
   .ic_save       = dvr_timerec_entry_class_save,
   .ic_get_title  = dvr_timerec_entry_class_get_title,
   .ic_delete     = dvr_timerec_entry_class_delete,
+  .ic_perm       = dvr_timerec_entry_class_perm,
   .ic_properties = (const property_t[]) {
     {
       .type     = PT_BOOL,
@@ -539,7 +558,7 @@ const idclass_t dvr_timerec_entry_class = {
       .id       = "title",
       .name     = "Title",
       .off      = offsetof(dvr_timerec_entry_t, dte_title),
-      .def.s    = "Time-%x-%R",
+      .def.s    = "Time-%F_%R",
     },
     {
       .type     = PT_STR,
@@ -615,7 +634,7 @@ const idclass_t dvr_timerec_entry_class = {
       .type     = PT_STR,
       .id       = "owner",
       .name     = "Owner",
-      .off      = offsetof(dvr_timerec_entry_t, dte_creator),
+      .off      = offsetof(dvr_timerec_entry_t, dte_owner),
       .opts     = PO_RDONLY,
     },
     {
@@ -733,4 +752,15 @@ timerec_destroy_by_config(dvr_config_t *kcfg, int delconf)
     if (delconf)
       dvr_timerec_save(dte);
   }
+}
+
+/**
+ *
+ */
+int
+dvr_timerec_get_retention( dvr_timerec_entry_t *dte )
+{
+  if (dte->dte_retention > 0)
+    return dte->dte_retention;
+  return dte->dte_config->dvr_retention_days;
 }

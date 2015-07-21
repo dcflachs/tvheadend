@@ -161,7 +161,7 @@ int  htsmsg_set_str(htsmsg_t *msg, const char *name, const char *str);
 /**
  * Add an field where source is a list or map message.
  */
-void htsmsg_add_msg(htsmsg_t *msg, const char *name, htsmsg_t *sub);
+htsmsg_t *htsmsg_add_msg(htsmsg_t *msg, const char *name, htsmsg_t *sub);
 
 /**
  * Add an field where source is a double
@@ -225,6 +225,8 @@ int htsmsg_field_get_s64(htsmsg_field_t *f, int64_t *s64p);
  * Return the field \p name as an s64.
  */
 int64_t htsmsg_get_s64_or_default(htsmsg_t *msg, const char *name, int64_t def);
+
+int bool_check(const char *str);
 
 int htsmsg_field_get_bool(htsmsg_field_t *f, int *boolp);
 

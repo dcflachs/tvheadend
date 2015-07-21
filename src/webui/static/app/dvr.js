@@ -11,22 +11,29 @@ tvheadend.dvrDetails = function(uuid) {
         var params = d[0].params;
         var chicon = params[0].value;
         var title = params[1].value;
-        var episode = params[2].value;
-        var start_real = params[3].value;
-        var stop_real = params[4].value;
-        var duration = params[5].value;
-        var desc = params[6].value;
-        var status = params[7].value;
-        var filesize = params[8].value;
-        var comment = params[9].value;
+        var subtitle = params[2].value;
+        var episode = params[3].value;
+        var start_real = params[4].value;
+        var stop_real = params[5].value;
+        var duration = params[6].value;
+        var desc = params[7].value;
+        var status = params[8].value;
+        var filesize = params[9].value;
+        var comment = params[10].value;
+        var duplicate = params[11].value;
         var content = '';
         var but;
 
         if (chicon != null && chicon.length > 0)
             content += '<img class="x-epg-chicon" src="' + chicon + '">';
 
+        if (duplicate)
+            content += '<div class="x-epg-meta"><font color="red"><div class="x-epg-prefix">Will be skipped<br>because is rerun of:</div>' + tvheadend.niceDate(duplicate * 1000) + '</font></div>';
+
         if (title)
           content += '<div class="x-epg-title">' + title + '</div>';
+        if (subtitle)
+            content += '<div class="x-epg-title">' + subtitle + '</div>';
         if (episode)
           content += '<div class="x-epg-title">' + episode + '</div>';
         if (start_real)
@@ -64,8 +71,8 @@ tvheadend.dvrDetails = function(uuid) {
         url: 'api/idnode/load',
         params: {
             uuid: uuid,
-            list: 'channel_icon,disp_title,episode,start_real,stop_real,' +
-                  'duration,disp_description,status,filesize,comment'
+            list: 'channel_icon,disp_title,disp_subtitle,episode,start_real,stop_real,' +
+                  'duration,disp_description,status,filesize,comment,duplicate'
         },
         success: function(d) {
             d = json_decode(d);
@@ -214,9 +221,14 @@ tvheadend.dvr_upcoming = function(panel, index) {
             }
         },
         del: true,
-        list: 'disp_title,episode,pri,start_real,stop_real,' +
-              'duration,channelname,owner,creator,config_name,' +
-              'sched_status,comment',
+        list: 'duplicate,disp_title,disp_subtitle,episode,pri,start_real,stop_real,' +
+              'duration,filesize,channel,owner,creator,config_name,' +
+              'sched_status,errors,data_errors,comment',
+        columns: {
+            filesize: {
+                renderer: tvheadend.filesizeRenderer()
+            }
+        },
         sort: {
           field: 'start_real',
           direction: 'ASC'
@@ -277,9 +289,9 @@ tvheadend.dvr_finished = function(panel, index) {
         del: true,
         delquestion: 'Do you really want to delete the selected recordings?<br/><br/>' +
                      'The associated file will be removed from the storage.',
-        list: 'disp_title,episode,start_real,stop_real,' +
+        list: 'disp_title,disp_subtitle,episode,start_real,stop_real,' +
               'duration,filesize,channelname,owner,creator,' +
-              'sched_status,url,comment',
+              'config_name,sched_status,errors,data_errors,url,comment',
         columns: {
             filesize: {
                 renderer: tvheadend.filesizeRenderer()
@@ -357,9 +369,9 @@ tvheadend.dvr_failed = function(panel, index) {
         del: true,
         delquestion: 'Do you really want to delete the selected recordings?<br/><br/>' +
                      'The associated file will be removed from the storage.',
-        list: 'disp_title,episode,start_real,stop_real,' +
-              'duration,filesize,channelname,owner,creator,' +
-              'status,sched_status,url,comment',
+        list: 'disp_title,disp_subtitle,episode,start_real,stop_real,' +
+              'duration,filesize,channelname,owner,creator,config_name,' +
+              'status,sched_status,errors,data_errors,url,comment',
         columns: {
             filesize: {
                 renderer: tvheadend.filesizeRenderer()
@@ -370,7 +382,7 @@ tvheadend.dvr_failed = function(panel, index) {
           direction: 'ASC'
         },
         plugins: [actions],
-		lcol: [
+        lcol: [
             actions,
             {
                 width: 40,
@@ -436,15 +448,24 @@ tvheadend.autorec_editor = function(panel, index) {
             name:         { width: 200 },
             directory:    { width: 200 },
             title:        { width: 300 },
+            fulltext:     { width: 70 },
             channel:      { width: 200 },
             tag:          { width: 200 },
             content_type: { width: 100 },
-            minduration:  { width: 80 },
-            maxduration:  { width: 80 },
+            minduration:  { width: 100 },
+            maxduration:  { width: 100 },
             weekdays:     { width: 160 },
-            start:        { width: 120 },
-            start_window: { width: 100 },
+            start:        { width: 80 },
+            start_window: { width: 80 },
+            start_extra:  { width: 80 },
+            stop_extra:   { width: 80 },
+            weekdays: {
+                width: 120,
+                renderer: function(st) { return tvheadend.weekdaysRenderer(st); }
+            },
             pri:          { width: 80 },
+            dedup:        { width: 160 },
+            retention:    { width: 80 },
             config_name:  { width: 120 },
             owner:        { width: 100 },
             creator:      { width: 200 },
@@ -453,19 +474,14 @@ tvheadend.autorec_editor = function(panel, index) {
         add: {
             url: 'api/dvr/autorec',
             params: {
-               list: 'enabled,name,directory,title,channel,tag,content_type,minduration,' +
-                     'maxduration,weekdays,start,start_window,pri,config_name,comment'
+               list: 'enabled,name,directory,title,fulltext,channel,tag,content_type,minduration,' +
+                     'maxduration,weekdays,start,start_window,pri,dedup,config_name,comment'
             },
             create: { }
         },
         del: true,
-        list: 'enabled,name,directory,title,channel,tag,content_type,minduration,' +
-              'maxduration,weekdays,start,start_window,pri,config_name,owner,creator,comment',
-        columns: {
-            weekdays: {
-                renderer: function(st) { return tvheadend.weekdaysRenderer(st); }
-            }
-        },
+        list: 'enabled,name,directory,title,fulltext,channel,tag,content_type,minduration,' +
+              'maxduration,weekdays,start,start_window,pri,dedup,config_name,owner,creator,comment',
         sort: {
           field: 'name',
           direction: 'ASC'
@@ -496,7 +512,10 @@ tvheadend.timerec_editor = function(panel, index) {
             directory:    { width: 200 },
             title:        { width: 300 },
             channel:      { width: 200 },
-            weekdays:     { width: 160 },
+            weekdays: {
+                width: 120,
+                renderer: function(st) { return tvheadend.weekdaysRenderer(st); }
+            },
             start:        { width: 120 },
             stop:         { width: 120 },
             pri:          { width: 80 },
@@ -514,11 +533,6 @@ tvheadend.timerec_editor = function(panel, index) {
         },
         del: true,
         list: 'enabled,name,directory,title,channel,weekdays,start,stop,pri,config_name,owner,creator,comment',
-        columns: {
-            weekdays: {
-                renderer: function(st) { return tvheadend.weekdaysRenderer(st); }
-            }
-        },
         sort: {
           field: 'name',
           direction: 'ASC'

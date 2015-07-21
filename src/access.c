@@ -1,6 +1,6 @@
 /*
  *  tvheadend, access control
- *  Copyright (C) 2008 Andreas Öman
+ *  Copyright (C) 2008 Andreas Ã–man
  *
  *  This program is free software: you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -155,8 +155,7 @@ access_ticket_verify2(const char *id, const char *resource)
     return NULL;
 
   if (tvheadend_webroot) {
-    strcpy(buf, tvheadend_webroot);
-    strcat(buf, at->at_resource);
+    snprintf(buf, sizeof(buf), "%s%s", tvheadend_webroot, at->at_resource);
     r = buf;
   } else {
     r = at->at_resource;
@@ -353,20 +352,23 @@ static void
 access_dump_a(access_t *a)
 {
   htsmsg_field_t *f;
+  size_t l = 0;
   char buf[1024];
   int first;
 
-  snprintf(buf, sizeof(buf),
-    "%s:%s [%s%s%s%s%s%s%s], conn=%u, chmin=%llu, chmax=%llu%s",
+  tvh_strlcatf(buf, sizeof(buf), l,
+    "%s:%s [%c%c%c%c%c%c%c%c%c], conn=%u, chmin=%llu, chmax=%llu%s",
     a->aa_representative ?: "<no-id>",
     a->aa_username ?: "<no-user>",
-    a->aa_rights & ACCESS_STREAMING          ? "S" : "",
-    a->aa_rights & ACCESS_ADVANCED_STREAMING ? "A" : "",
-    a->aa_rights & ACCESS_HTSP_STREAMING     ? "T" : "",
-    a->aa_rights & ACCESS_WEB_INTERFACE      ? "W" : "",
-    a->aa_rights & ACCESS_RECORDER           ? "R" : "",
-    a->aa_rights & ACCESS_HTSP_RECORDER      ? "E" : "",
-    a->aa_rights & ACCESS_ADMIN              ? "*" : "",
+    a->aa_rights & ACCESS_STREAMING          ? 'S' : ' ',
+    a->aa_rights & ACCESS_ADVANCED_STREAMING ? 'A' : ' ',
+    a->aa_rights & ACCESS_HTSP_STREAMING     ? 'T' : ' ',
+    a->aa_rights & ACCESS_WEB_INTERFACE      ? 'W' : ' ',
+    a->aa_rights & ACCESS_RECORDER           ? 'R' : ' ',
+    a->aa_rights & ACCESS_HTSP_RECORDER      ? 'E' : ' ',
+    a->aa_rights & ACCESS_ALL_RECORDER       ? 'L' : ' ',
+    a->aa_rights & ACCESS_ALL_RW_RECORDER    ? 'D' : ' ',
+    a->aa_rights & ACCESS_ADMIN              ? '*' : ' ',
     a->aa_conn_limit,
     (long long)a->aa_chmin, (long long)a->aa_chmax,
     a->aa_match ? ", matched" : "");
@@ -377,14 +379,14 @@ access_dump_a(access_t *a)
       profile_t *pro = profile_find_by_uuid(htsmsg_field_get_str(f) ?: "");
       if (pro) {
         if (first)
-          snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), ", profile=");
-        snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "%s'%s'",
+          tvh_strlcatf(buf, sizeof(buf), l, ", profile=");
+        tvh_strlcatf(buf, sizeof(buf), l, "%s'%s'",
                  first ? "" : ",", pro->pro_name ?: "");
         first = 0;
       }
     }
   } else {
-    snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), ", profile=ANY");
+    tvh_strlcatf(buf, sizeof(buf), l, ", profile=ANY");
   }
 
   if (a->aa_dvrcfgs) {
@@ -393,14 +395,14 @@ access_dump_a(access_t *a)
       dvr_config_t *cfg = dvr_config_find_by_uuid(htsmsg_field_get_str(f) ?: "");
       if (cfg) {
         if (first)
-          snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), ", dvr=");
-        snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "%s'%s'",
+          tvh_strlcatf(buf, sizeof(buf), l, ", dvr=");
+        tvh_strlcatf(buf, sizeof(buf), l, "%s'%s'",
                  first ? "" : ",", cfg->dvr_config_name ?: "");
         first = 0;
       }
     }
   } else {
-    snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), ", dvr=ANY");
+    tvh_strlcatf(buf, sizeof(buf), l, ", dvr=ANY");
   }
 
   if (a->aa_chtags) {
@@ -409,14 +411,14 @@ access_dump_a(access_t *a)
       channel_tag_t *ct = channel_tag_find_by_uuid(htsmsg_field_get_str(f) ?: "");
       if (ct) {
         if (first)
-          snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), ", tags=");
-        snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "%s'%s'",
+          tvh_strlcatf(buf, sizeof(buf), l, ", tags=");
+        tvh_strlcatf(buf, sizeof(buf), l, "%s'%s'",
                  first ? "" : ",", ct->ct_name ?: "");
         first = 0;
       }
     }
   } else {
-    snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), ", tag=ANY");
+    tvh_strlcatf(buf, sizeof(buf), l, ", tag=ANY");
   }
 
   tvhtrace("access", "%s", buf);
@@ -479,7 +481,7 @@ access_get(const char *username, const char *password, struct sockaddr *src)
   access_t *a = calloc(1, sizeof(*a));
   access_entry_t *ae;
 
-  if (username) {
+  if (username && username[0]) {
     a->aa_username = strdup(username);
     a->aa_representative = strdup(username);
   } else {
@@ -548,7 +550,7 @@ access_get_hashed(const char *username, const uint8_t digest[20],
   SHA_CTX shactx;
   uint8_t d[20];
 
-  if (username) {
+  if (username && username[0]) {
     a->aa_username = strdup(username);
     a->aa_representative = strdup(username);
   } else {
@@ -615,8 +617,6 @@ access_get_hashed(const char *username, const uint8_t digest[20],
   return a;
 }
 
-
-
 /**
  *
  */
@@ -625,6 +625,9 @@ access_get_by_addr(struct sockaddr *src)
 {
   access_t *a = calloc(1, sizeof(*a));
   access_entry_t *ae;
+
+  a->aa_representative = malloc(50);
+  tcp_get_ip_str(src, a->aa_representative, 50);
 
   if(access_noacl) {
     a->aa_rights = ACCESS_FULL;
@@ -812,10 +815,14 @@ access_entry_update_rights(access_entry_t *ae)
     r |= ACCESS_RECORDER;
   if (ae->ae_htsp_dvr)
     r |= ACCESS_HTSP_RECORDER;
+  if (ae->ae_all_dvr)
+    r |= ACCESS_ALL_RECORDER;
   if (ae->ae_webui)
     r |= ACCESS_WEB_INTERFACE;
   if (ae->ae_admin)
     r |= ACCESS_ADMIN;
+  if (ae->ae_all_rw_dvr)
+    r |= ACCESS_ALL_RW_RECORDER;
   ae->ae_rights = r;
 }
 
@@ -846,8 +853,10 @@ access_entry_create(const char *uuid, htsmsg_t *conf)
   TAILQ_INIT(&ae->ae_ipmasks);
 
   if (conf) {
+    /* defaults */
     ae->ae_htsp_streaming = 1;
     ae->ae_htsp_dvr       = 1;
+    ae->ae_all_dvr        = 1;
     idnode_load(&ae->ae_id, conf);
     /* note password has PO_NOSAVE, thus it must be set manually */
     if ((s = htsmsg_get_str(conf, "password")) != NULL)
@@ -1067,7 +1076,7 @@ access_entry_class_prefix_get(void *o)
       s_addr = htonl(ai->ai_network);
       inet_ntop(AF_INET, &s_addr, addrbuf, sizeof(addrbuf));
     }
-    pos += snprintf(buf+pos, sizeof(buf)-pos, ",%s/%d", addrbuf, ai->ai_prefixlen);
+    tvh_strlcatf(buf, sizeof(buf), pos, ",%s/%d", addrbuf, ai->ai_prefixlen);
   }
   return &ret;
 }
@@ -1298,6 +1307,18 @@ const idclass_t access_entry_class = {
       .off      = offsetof(access_entry_t, ae_htsp_dvr),
     },
     {
+      .type     = PT_BOOL,
+      .id       = "all_dvr",
+      .name     = "All DVR",
+      .off      = offsetof(access_entry_t, ae_all_dvr),
+    },
+    {
+      .type     = PT_BOOL,
+      .id       = "all_rw_dvr",
+      .name     = "All DVR (rw)",
+      .off      = offsetof(access_entry_t, ae_all_rw_dvr),
+    },
+    {
       .type     = PT_STR,
       .id       = "dvr_config",
       .name     = "DVR Config Profile",
@@ -1405,6 +1426,8 @@ access_init(int createdefault, int noacl)
     ae->ae_htsp_streaming = 1;
     ae->ae_dvr            = 1;
     ae->ae_htsp_dvr       = 1;
+    ae->ae_all_dvr        = 1;
+    ae->ae_all_rw_dvr     = 1;
     ae->ae_webui          = 1;
     ae->ae_admin          = 1;
     access_entry_update_rights(ae);

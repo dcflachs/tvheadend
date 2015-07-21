@@ -34,6 +34,7 @@
 #include "htsp_server.h"
 #include "epggrab.h"
 #include "imagecache.h"
+#include "notify.h"
 
 /* Broadcast hashing */
 #define EPG_HASH_WIDTH 1024
@@ -51,6 +52,8 @@ epg_object_tree_t epg_serieslinks;
 /* Other special case lists */
 epg_object_list_t epg_object_unref;
 epg_object_list_t epg_object_updated;
+
+int epg_in_load;
 
 /* Global counter */
 static uint32_t _epg_object_idx    = 0;
@@ -1101,19 +1104,19 @@ size_t epg_episode_number_format
   epg_episode_num_t num;
   epg_episode_get_epnum(episode, &num);
   if ( num.e_num ) {
-    if (pre) i += snprintf(&buf[i], len-i, "%s", pre);
+    if (pre) tvh_strlcatf(buf, len, i, "%s", pre);
     if ( sfmt && num.s_num ) {
-      i += snprintf(&buf[i], len-i, sfmt, num.s_num);
+      tvh_strlcatf(buf, len, i, sfmt, num.s_num);
       if ( cfmt && num.s_cnt )
-        i += snprintf(&buf[i], len-i, cfmt, num.s_cnt);
-      if (sep) i += snprintf(&buf[i], len-i, "%s", sep);
+        tvh_strlcatf(buf, len, i, cfmt, num.s_cnt);
+      if (sep) tvh_strlcatf(buf, len, i, "%s", sep);
     }
-    i += snprintf(&buf[i], len-i, efmt, num.e_num);
+    tvh_strlcatf(buf, len, i, efmt, num.e_num);
     if ( cfmt && num.e_cnt )
-      i+= snprintf(&buf[i], len-i, cfmt, num.e_cnt);
+      tvh_strlcatf(buf, len, i, cfmt, num.e_cnt);
   } else if ( num.text ) {
-    if (pre) i += snprintf(&buf[i], len-i, "%s", pre);
-    i += snprintf(&buf[i], len-i, "%s", num.text);
+    if (pre) tvh_strlcatf(buf, len, i, "%s", pre);
+    tvh_strlcatf(buf, len, i, "%s", num.text);
   }
   return i;
 }
@@ -1289,7 +1292,7 @@ const char *epg_episode_get_subtitle
   return lang_str_get(e->subtitle, lang);
 }
 
-const char *epg_episode_get_summary 
+const char *epg_episode_get_summary
   ( const epg_episode_t *e, const char *lang )
 {
   if (!e || !e->summary) return NULL;
@@ -1559,7 +1562,13 @@ void epg_channel_unlink ( channel_t *ch )
 static void _epg_broadcast_destroy ( void *eo )
 {
   epg_broadcast_t *ebc = eo;
-  if (ebc->created)     htsp_event_delete(ebc);
+  char id[16];
+
+  if (ebc->created) {
+    htsp_event_delete(ebc);
+    snprintf(id, sizeof(id), "%u", ebc->id);
+    notify_delayed(id, "epg", "delete");
+  }
   if (ebc->episode)     _epg_episode_rem_broadcast(ebc->episode, ebc);
   if (ebc->serieslink)  _epg_serieslink_rem_broadcast(ebc->serieslink, ebc);
   if (ebc->summary)     lang_str_destroy(ebc->summary);
@@ -1571,10 +1580,20 @@ static void _epg_broadcast_destroy ( void *eo )
 static void _epg_broadcast_updated ( void *eo )
 {
   epg_broadcast_t *ebc = eo;
-  if (ebc->created)
-    htsp_event_update(eo);
+  char id[16];
+
+  if (!epg_in_load)
+    snprintf(id, sizeof(id), "%u", ebc->id);
   else
+    id[0] = '\0';
+
+  if (ebc->created) {
+    htsp_event_update(eo);
+    notify_delayed(id, "epg", "update");
+  } else {
     htsp_event_add(eo);
+    notify_delayed(id, "epg", "create");
+  }
   dvr_event_updated(eo);
   dvr_autorec_check_event(eo);
 }
@@ -2118,12 +2137,11 @@ size_t epg_genre_get_str ( const epg_genre_t *genre, int major_only,
   if (!_epg_genre_names[maj][0]) return 0;
   min = major_only ? 0 : (genre->code & 0xf);
   if (!min || major_prefix ) {
-    ret = snprintf(buf, len, "%s", _epg_genre_names[maj][0]);
-    if (min) ret += snprintf(buf+ret, len-ret, " : ");
+    tvh_strlcatf(buf, len, ret, "%s", _epg_genre_names[maj][0]);
+    if (min) tvh_strlcatf(buf, len, ret, " : ");
   }
-  if (min && _epg_genre_names[maj][min]) {
-    ret += snprintf(buf+ret, len-ret, "%s", _epg_genre_names[maj][min]);
-  }
+  if (min && _epg_genre_names[maj][min])
+    tvh_strlcatf(buf, len, ret, "%s", _epg_genre_names[maj][min]);
   return ret;
 }
 
@@ -2263,6 +2281,7 @@ _eq_add ( epg_query_t *eq, epg_broadcast_t *e )
 {
   const char *s, *lang = eq->lang;
   epg_episode_t *ep;
+  int fulltext = eq->stitle && eq->fulltext;
 
   /* Filtering */
   if (e == NULL) return;
@@ -2292,22 +2311,36 @@ _eq_add ( epg_query_t *eq, epg_broadcast_t *e )
     }
     if (!r) return;
   }
-  if (eq->title.comp != EC_NO || eq->stitle) {
+  if (fulltext) {
+    if ((s = epg_episode_get_title(ep, lang)) == NULL ||
+        regexec(&eq->stitle_re, s, 0, NULL, 0)) {
+      if ((s = epg_episode_get_subtitle(ep, lang)) == NULL ||
+          regexec(&eq->stitle_re, s, 0, NULL, 0)) {
+        if ((s = epg_broadcast_get_summary(e, lang)) == NULL ||
+            regexec(&eq->stitle_re, s, 0, NULL, 0)) {
+          if ((s = epg_broadcast_get_description(e, lang)) == NULL ||
+              regexec(&eq->stitle_re, s, 0, NULL, 0)) {
+            return;
+          }
+        }
+      }
+    }
+  }
+  if (eq->title.comp != EC_NO || (eq->stitle && !fulltext)) {
     if ((s = epg_episode_get_title(ep, lang)) == NULL) return;
-    if (eq->stitle)
-      if (regexec(&eq->stitle_re, s, 0, NULL, 0)) return;
-    if (_eq_comp_str(&eq->title, s)) return;
+    if (eq->stitle && !fulltext && regexec(&eq->stitle_re, s, 0, NULL, 0)) return;
+    if (eq->title.comp != EC_NO && _eq_comp_str(&eq->title, s)) return;
   }
   if (eq->subtitle.comp != EC_NO) {
     if ((s = epg_episode_get_subtitle(ep, lang)) == NULL) return;
     if (_eq_comp_str(&eq->subtitle, s)) return;
   }
   if (eq->summary.comp != EC_NO) {
-    if ((s = epg_episode_get_summary(ep, lang)) == NULL) return;
+    if ((s = epg_broadcast_get_summary(e, lang)) == NULL) return;
     if (_eq_comp_str(&eq->summary, s)) return;
   }
   if (eq->description.comp != EC_NO) {
-    if ((s = epg_episode_get_description(ep, lang)) == NULL) return;
+    if ((s = epg_broadcast_get_description(e, lang)) == NULL) return;
     if (_eq_comp_str(&eq->description, s)) return;
   }
 

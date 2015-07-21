@@ -1,6 +1,6 @@
 /*
  *  tvheadend, channel functions
- *  Copyright (C) 2007 Andreas Öman
+ *  Copyright (C) 2007 Andreas Ã–man
  *
  *  This program is free software: you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -44,6 +44,8 @@
 #include "htsbuf.h"
 #include "bouquet.h"
 #include "intlconv.h"
+
+#define CHANNEL_BLANK_NAME  "{name-not-set}"
 
 struct channel_tree channels;
 
@@ -248,7 +250,7 @@ channel_class_epggrab_set ( void *o, const void *v )
   }
     
   /* Link */
-  if (ch->ch_epgauto && l) {
+  if (l) {
     HTSMSG_FOREACH(f, l) {
       if ((ec = epggrab_channel_find_by_id(htsmsg_field_get_str(f))))
         save |= epggrab_channel_link(ec, ch);
@@ -277,14 +279,6 @@ channel_class_epggrab_list ( void *o )
   htsmsg_add_bool(e, "enum", 1);
   htsmsg_add_msg(m, "params", e);
   return m;
-}
-
-static void
-channel_class_epgauto_notify ( void *obj )
-{
-  channel_t *ch = obj;
-  if (!ch->ch_epgauto)
-    channel_class_epggrab_set(obj, NULL);
 }
 
 static const void *
@@ -363,7 +357,6 @@ const idclass_t channel_class = {
       .id       = "epgauto",
       .name     = "Auto EPG Channel",
       .off      = offsetof(channel_t, ch_epgauto),
-      .notify   = channel_class_epgauto_notify,
     },
     {
       .type     = PT_STR,
@@ -400,7 +393,7 @@ const idclass_t channel_class = {
       .rend     = channel_class_services_rend,
     },
     {
-      .type     = PT_INT,
+      .type     = PT_STR,
       .islist   = 1,
       .id       = "tags",
       .name     = "Tags",
@@ -575,7 +568,7 @@ channel_set_tags_by_list ( channel_t *ch, htsmsg_t *tags )
 const char *
 channel_get_name ( channel_t *ch )
 {
-  static const char *blank = "";
+  static const char *blank = CHANNEL_BLANK_NAME;
   const char *s;
   channel_service_mapping_t *csm;
   if (ch->ch_name && *ch->ch_name) return ch->ch_name;
@@ -583,6 +576,19 @@ channel_get_name ( channel_t *ch )
     if ((s = service_get_channel_name(csm->csm_svc)))
       return s;
   return blank;
+}
+
+int
+channel_set_name ( channel_t *ch, const char *name )
+{
+  int save = 0;
+  if (!ch || !name) return 0;
+  if (!ch->ch_name || strcmp(ch->ch_name, name) ) {
+    if (ch->ch_name) free(ch->ch_name);
+    ch->ch_name = strdup(name);
+    save = 1;
+  }
+  return save;
 }
 
 int64_t
@@ -607,6 +613,19 @@ channel_get_number ( channel_t *ch )
     return n;
   }
   return 0;
+}
+
+int
+channel_set_number ( channel_t *ch, uint32_t major, uint32_t minor )
+{
+  int save = 0;
+  int64_t chnum = (uint64_t)major * CHANNEL_SPLIT + (uint64_t)minor;
+  if (!ch || !chnum) return 0;
+  if (!ch->ch_number || ch->ch_number != chnum) {
+    ch->ch_number = chnum;
+    save = 1;
+  }
+  return save;
 }
 
 static int
@@ -642,7 +661,8 @@ channel_get_icon ( channel_t *ch )
 
     /* No user icon - try to get the channel icon by name */
     if (!pick && chicon && chicon[0] >= ' ' && chicon[0] <= 122 &&
-        (chname = channel_get_name(ch)) != NULL && chname[0]) {
+        (chname = channel_get_name(ch)) != NULL && chname[0] &&
+        strcmp(chname, CHANNEL_BLANK_NAME)) {
       const char *chi, *send, *sname, *s;
       chi = strdup(chicon);
 
@@ -690,7 +710,7 @@ channel_get_icon ( channel_t *ch )
       if (i > 1 || check_file(buf)) {
         icon = ch->ch_icon = strdup(buf);
         channel_save(ch);
-        idnode_notify_simple(&ch->ch_id);
+        idnode_notify_changed(&ch->ch_id);
       }
     }
 
@@ -705,7 +725,7 @@ channel_get_icon ( channel_t *ch )
         if (i > 1 || check_file(buf2)) {
           icon = ch->ch_icon = strdup(icn);
           channel_save(ch);
-          idnode_notify_simple(&ch->ch_id);
+          idnode_notify_changed(&ch->ch_id);
           break;
         }
       }
@@ -733,6 +753,18 @@ channel_get_icon ( channel_t *ch )
   }
 
   return buf;
+}
+
+int channel_set_icon ( channel_t *ch, const char *icon )
+{
+  int save = 0;
+  if (!ch || !icon) return 0;
+  if (!ch->ch_icon || strcmp(ch->ch_icon, icon) ) {
+    if (ch->ch_icon) free(ch->ch_icon);
+    ch->ch_icon = strdup(icon);
+    save = 1;
+  }
+  return save;
 }
 
 /* **************************************************************************
@@ -977,7 +1009,7 @@ channel_tag_unmap(channel_t *ch, channel_tag_t *ct)
       LIST_REMOVE(ctm, ctm_tag_link);
       free(ctm);
       channel_save(ch);
-      idnode_notify_simple(&ch->ch_id);
+      idnode_notify_changed(&ch->ch_id);
       if (ct->ct_enabled && !ct->ct_internal) {
         htsp_tag_update(ct);
         htsp_channel_update(ch);

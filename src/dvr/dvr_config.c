@@ -105,7 +105,7 @@ dvr_config_find_by_list(htsmsg_t *uuids, const char *name)
   htsmsg_field_t *f;
   const char *uuid, *uuid2;
 
-  cfg  = dvr_config_find_by_uuid(name);
+  cfg = dvr_config_find_by_uuid(name);
   if (!cfg)
     cfg  = dvr_config_find_by_name(name);
   uuid = cfg ? idnode_uuid_as_str(&cfg->dvr_id) : "";
@@ -121,7 +121,8 @@ dvr_config_find_by_list(htsmsg_t *uuids, const char *name)
       }
     }
   } else {
-    res = cfg;
+    if (cfg->dvr_enabled)
+      res = cfg;
   }
   if (!res)
     res = dvr_config_find_by_name_default(NULL);
@@ -179,19 +180,8 @@ dvr_config_create(const char *name, const char *uuid, htsmsg_t *conf)
   dvr_charset_update(cfg, intlconv_filesystem_charset());
   cfg->dvr_update_window = 24 * 3600;
 
-  /* series link support */
-  cfg->dvr_sl_brand_lock   = 1; // use brand linking
-  cfg->dvr_sl_season_lock  = 0; // ignore season (except if no brand)
-  cfg->dvr_sl_channel_lock = 1; // channel locked
-  cfg->dvr_sl_time_lock    = 0; // time slot (approx) locked
-  cfg->dvr_sl_more_recent  = 1; // Only record more reason episodes
-  cfg->dvr_sl_quality_lock = 1; // Don't attempt to ajust quality
-
   /* Muxer config */
   cfg->dvr_muxcnf.m_cache  = MC_CACHE_DONTKEEP;
-
-  /* dup detect */
-  cfg->dvr_dup_detect_episode = 1; // detect dup episodes
 
   /* Default recording file and directory permissions */
 
@@ -260,6 +250,43 @@ dvr_config_destroy(dvr_config_t *cfg, int delconf)
 /**
  *
  */
+
+static void
+dvr_config_storage_check(dvr_config_t *cfg)
+{
+  char buf[PATH_MAX];
+  struct stat st;
+  const char *homedir;
+
+  if(cfg->dvr_storage != NULL && cfg->dvr_storage[0])
+    return;
+
+  /* Try to figure out a good place to put them videos */
+
+  homedir = getenv("HOME");
+
+  if(homedir != NULL) {
+    snprintf(buf, sizeof(buf), "%s/Videos", homedir);
+    if(stat(buf, &st) == 0 && S_ISDIR(st.st_mode))
+      cfg->dvr_storage = strdup(buf);
+
+    else if(stat(homedir, &st) == 0 && S_ISDIR(st.st_mode))
+      cfg->dvr_storage = strdup(homedir);
+    else
+      cfg->dvr_storage = strdup(getcwd(buf, sizeof(buf)));
+  }
+
+  tvhlog(LOG_WARNING, "dvr",
+         "Output directory for video recording is not yet configured "
+         "for DVR configuration \"%s\". "
+         "Defaulting to to \"%s\". "
+         "This can be changed from the web user interface.",
+         cfg->dvr_config_name, cfg->dvr_storage);
+}
+
+/**
+ *
+ */
 void
 dvr_config_delete(const char *name)
 {
@@ -282,6 +309,7 @@ dvr_config_save(dvr_config_t *cfg)
 
   lock_assert(&global_lock);
 
+  dvr_config_storage_check(cfg);
   idnode_save(&cfg->dvr_id, m);
   hts_settings_save(m, "dvr/config/%s", idnode_uuid_as_str(&cfg->dvr_id));
   htsmsg_destroy(m);
@@ -572,13 +600,6 @@ const idclass_t dvr_config_class = {
       .group    = 1,
     },
     {
-      .type     = PT_BOOL,
-      .id       = "episode-duplicate-detection",
-      .name     = "Episode Duplicate Detect",
-      .off      = offsetof(dvr_config_t, dvr_episode_duplicate),
-      .group    = 1,
-    },
-    {
       .type     = PT_U32,
       .id       = "epg-update-window",
       .name     = "EPG Update Window",
@@ -760,9 +781,6 @@ dvr_config_init(void)
 {
   htsmsg_t *m, *l;
   htsmsg_field_t *f;
-  char buf[500];
-  const char *homedir;
-  struct stat st;
   dvr_config_t *cfg;
 
   dvr_iov_max = sysconf(_SC_IOV_MAX);
@@ -784,31 +802,8 @@ dvr_config_init(void)
   cfg = dvr_config_find_by_name_default(NULL);
   assert(cfg);
 
-  LIST_FOREACH(cfg, &dvrconfigs, config_link) {
-    if(cfg->dvr_storage == NULL || !strlen(cfg->dvr_storage)) {
-      /* Try to figure out a good place to put them videos */
-
-      homedir = getenv("HOME");
-
-      if(homedir != NULL) {
-        snprintf(buf, sizeof(buf), "%s/Videos", homedir);
-        if(stat(buf, &st) == 0 && S_ISDIR(st.st_mode))
-          cfg->dvr_storage = strdup(buf);
-        
-        else if(stat(homedir, &st) == 0 && S_ISDIR(st.st_mode))
-          cfg->dvr_storage = strdup(homedir);
-        else
-          cfg->dvr_storage = strdup(getcwd(buf, sizeof(buf)));
-      }
-
-      tvhlog(LOG_WARNING, "dvr",
-             "Output directory for video recording is not yet configured "
-             "for DVR configuration \"%s\". "
-             "Defaulting to to \"%s\". "
-             "This can be changed from the web user interface.",
-             cfg->dvr_config_name, cfg->dvr_storage);
-    }
-  }
+  LIST_FOREACH(cfg, &dvrconfigs, config_link)
+    dvr_config_storage_check(cfg);
 }
 
 void

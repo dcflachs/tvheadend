@@ -216,6 +216,14 @@ const idclass_t linuxdvb_satconf_class =
   .ic_save       = linuxdvb_satconf_class_save,
   .ic_properties = (const property_t[]) {
     {
+      .type     = PT_BOOL,
+      .id       = "early_tune",
+      .name     = "Tune Before DiseqC",
+      .off      = offsetof(linuxdvb_satconf_t, ls_early_tune),
+      .opts     = PO_ADVANCED,
+      .def.i    = 1
+    },
+    {
       .type     = PT_INT,
       .id       = "diseqc_repeats",
       .name     = "DiseqC repeats",
@@ -229,6 +237,7 @@ const idclass_t linuxdvb_satconf_class =
       .name     = "Full DiseqC",
       .off      = offsetof(linuxdvb_satconf_t, ls_diseqc_full),
       .opts     = PO_ADVANCED,
+      .def.i    = 1
     },
     {
       .type     = PT_BOOL,
@@ -711,7 +720,7 @@ static void linuxdvb_satconf_ele_tune_cb ( void *o );
 static int
 linuxdvb_satconf_ele_tune ( linuxdvb_satconf_ele_t *lse )
 {
-  int r, i, b, pol;
+  int r, i, vol, pol, band, freq;
   uint32_t f;
   linuxdvb_satconf_t *ls = lse->lse_parent;
 
@@ -728,10 +737,18 @@ linuxdvb_satconf_ele_tune ( linuxdvb_satconf_ele_t *lse )
     (linuxdvb_diseqc_t*)lse->lse_lnb
   };
 
-  if (!lse->lse_en50494) {
-    pol = (lse->lse_lnb) ? lse->lse_lnb->lnb_pol(lse->lse_lnb, lm) & 0x1 : 0;
+  if (lse->lse_lnb) {
+    pol  = lse->lse_lnb->lnb_pol (lse->lse_lnb, lm) & 0x1;
+    band = lse->lse_lnb->lnb_band(lse->lse_lnb, lm) & 0x1;
+    freq = lse->lse_lnb->lnb_freq(lse->lse_lnb, lm);
   } else {
-    pol = 0; /* 13V */
+    tvherror("linuxdvb", "LNB is not defined!!!");
+    return -1;
+  }
+  if (!lse->lse_en50494) {
+    vol = pol;
+  } else {
+    vol  = 0; /* 13V */
   }
 
   /*
@@ -744,7 +761,7 @@ linuxdvb_satconf_ele_tune ( linuxdvb_satconf_ele_t *lse )
   if (!lse->lse_en50494 || lse->lse_switch || lse->lse_rotor) {
     if (ls->ls_diseqc_full) {
       ls->ls_last_tone_off = 0; /* force */
-      if (linuxdvb_satconf_start(ls, 0, pol))
+      if (linuxdvb_satconf_start(ls, 0, vol))
         return -1;
     }
   }
@@ -752,7 +769,7 @@ linuxdvb_satconf_ele_tune ( linuxdvb_satconf_ele_t *lse )
   /* Diseqc */  
   for (i = ls->ls_diseqc_idx; i < ARRAY_SIZE(lds); i++) {
     if (!lds[i]) continue;
-    r = lds[i]->ld_tune(lds[i], lm, ls, lse, pol);
+    r = lds[i]->ld_tune(lds[i], lm, ls, lse, vol, pol, band, freq);
 
     /* Error */
     if (r < 0) return r;
@@ -772,23 +789,21 @@ linuxdvb_satconf_ele_tune ( linuxdvb_satconf_ele_t *lse )
 
   /* LNB settings */
   /* EN50494 devices have another mechanism to select polarization */
-  if (!lse->lse_en50494) {
-    /* Set the voltage */
-    if (linuxdvb_diseqc_set_volt(ls, pol))
-      return -1;
-  }
+
+  /* Set the voltage */
+  if (linuxdvb_diseqc_set_volt(ls, vol))
+    return -1;
 
   /* Set the tone (en50494 don't use tone) */
   if (!lse->lse_en50494) {
-    b = lse->lse_lnb->lnb_band(lse->lse_lnb, lm);
-    if (ls->ls_diseqc_full || ls->ls_last_tone_off != b + 1) {
+    if (ls->ls_last_tone_off != band + 1) {
       ls->ls_last_tone_off = 0;
-      tvhtrace("diseqc", "set diseqc tone %s", b ? "on" : "off");
-      if (ioctl(lfe->lfe_fe_fd, FE_SET_TONE, b ? SEC_TONE_ON : SEC_TONE_OFF)) {
+      tvhtrace("diseqc", "set diseqc tone %s", band ? "on" : "off");
+      if (ioctl(lfe->lfe_fe_fd, FE_SET_TONE, band ? SEC_TONE_ON : SEC_TONE_OFF)) {
         tvherror("diseqc", "failed to set diseqc tone (e=%s)", strerror(errno));
         return -1;
       }
-      ls->ls_last_tone_off = b + 1;
+      ls->ls_last_tone_off = band + 1;
       usleep(20000); // Allow LNB to settle before tuning
     }
   }
@@ -797,7 +812,7 @@ linuxdvb_satconf_ele_tune ( linuxdvb_satconf_ele_t *lse )
   /* use en50494 tuning frequency, if needed (not channel frequency) */
   f = lse->lse_en50494
     ? ((linuxdvb_en50494_t*)lse->lse_en50494)->le_tune_freq
-    : lse->lse_lnb->lnb_freq(lse->lse_lnb, lm);
+    : freq;
   return linuxdvb_frontend_tune1(lfe, mmi, f);
 }
 
@@ -831,23 +846,15 @@ linuxdvb_satconf_start_mux
   f = lse->lse_lnb->lnb_freq(lse->lse_lnb, lm);
   if (f == (uint32_t)-1)
     return SM_CODE_TUNING_FAILED;
-#if 0
-  // Note: unfortunately, this test also "delays" the valid
-  //       tune request, so it's disabled now until we create
-  //       own parameter validator
-  if (!lse->lse_en50494) {
+
+  if (ls->ls_early_tune && !lse->lse_en50494) {
     r = linuxdvb_frontend_tune0(lfe, mmi, f);
     if (r) return r;
   } else {
     /* Clear the frontend settings, open frontend fd */
-    r = linuxdvb_frontend_clear(lfe);
+    r = linuxdvb_frontend_clear(lfe, mmi);
     if (r) return r;
   }
-#else
-  /* Clear the frontend settings, open frontend fd */
-  r = linuxdvb_frontend_clear(lfe);
-  if (r) return r;
-#endif
 
   /* Diseqc */
   ls->ls_mmi        = mmi;
@@ -890,6 +897,8 @@ linuxdvb_satconf_create
   ls->ls_type     = lst->type;
   TAILQ_INIT(&ls->ls_elements);
 
+  ls->ls_early_tune = 1;
+  ls->ls_diseqc_full = 1;
   ls->ls_max_rotor_move = 120;
 
   /* Create node */
@@ -1265,6 +1274,7 @@ linuxdvb_satconf_ele_destroy ( linuxdvb_satconf_ele_t *ls )
   if (ls->lse_switch)  linuxdvb_switch_destroy(ls->lse_switch);
   if (ls->lse_rotor)   linuxdvb_rotor_destroy(ls->lse_rotor);
   if (ls->lse_en50494) linuxdvb_en50494_destroy(ls->lse_en50494);
+  idnode_set_free(ls->lse_networks);
   free(ls->lse_name);
   free(ls);
 }
@@ -1322,18 +1332,7 @@ linuxdvb_satconf_delete ( linuxdvb_satconf_t *ls, int delconf )
   gtimer_disarm(&ls->ls_diseqc_timer);
   for (lse = TAILQ_FIRST(&ls->ls_elements); lse != NULL; lse = nxt) {
     nxt = TAILQ_NEXT(lse, lse_link);
-    TAILQ_REMOVE(&ls->ls_elements, lse, lse_link);
-    if (lse->lse_lnb)
-      linuxdvb_lnb_destroy(lse->lse_lnb);
-    if (lse->lse_switch)
-      linuxdvb_switch_destroy(lse->lse_switch);
-    if (lse->lse_rotor)
-      linuxdvb_rotor_destroy(lse->lse_rotor);
-    if (lse->lse_en50494)
-      linuxdvb_en50494_destroy(lse->lse_en50494);
-    idnode_unlink(&lse->lse_id);
-    idnode_set_free(lse->lse_networks);
-    free(lse);
+    linuxdvb_satconf_ele_destroy(lse);
   }
   idnode_unlink(&ls->ls_id);
   free(ls);
@@ -1417,7 +1416,7 @@ linuxdvb_diseqc_send
   for (i = 0; i < len; i++) {
     message.msg[3 + i] = (uint8_t)va_arg(ap, int);
 #if ENABLE_TRACE
-    c += snprintf(buf + c, sizeof(buf) - c, "%02X ", message.msg[3 + i]);
+    tvh_strlcatf(buf, sizeof(buf), c, "%02X ", message.msg[3 + i]);
 #endif
   }
   va_end(ap);

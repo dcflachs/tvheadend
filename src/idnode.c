@@ -44,10 +44,6 @@ typedef struct idclass_link
 static idnodes_rb_t           idnodes;
 static RB_HEAD(,idclass_link) idclasses;
 static RB_HEAD(,idclass_link) idrootclasses;
-static pthread_cond_t         idnode_cond;
-static pthread_mutex_t        idnode_mutex;
-static htsmsg_t              *idnode_queue;
-static void*                  idnode_thread(void* p);
 
 SKEL_DECLARE(idclasses_skel, idclass_link_t);
 
@@ -84,13 +80,9 @@ pthread_t idnode_tid;
 void
 idnode_init(void)
 {
-  idnode_queue = NULL;
   RB_INIT(&idnodes);
   RB_INIT(&idclasses);
   RB_INIT(&idrootclasses);
-  pthread_mutex_init(&idnode_mutex, NULL);
-  pthread_cond_init(&idnode_cond, NULL);
-  tvhthread_create(&idnode_tid, NULL, idnode_thread, NULL);
 }
 
 void
@@ -98,12 +90,6 @@ idnode_done(void)
 {
   idclass_link_t *il;
 
-  pthread_cond_signal(&idnode_cond);
-  pthread_join(idnode_tid, NULL);
-  pthread_mutex_lock(&idnode_mutex);
-  htsmsg_destroy(idnode_queue);
-  idnode_queue = NULL;
-  pthread_mutex_unlock(&idnode_mutex);  
   while ((il = RB_FIRST(&idclasses)) != NULL) {
     RB_REMOVE(&idclasses, il, link);
     free(il);
@@ -178,7 +164,7 @@ idnode_insert(idnode_t *in, const char *uuid, const idclass_t *class, int flags)
   assert(c == NULL);
 
   /* Fire event */
-  idnode_notify_simple(in);
+  idnode_notify_changed(in);
 
   return 0;
 }
@@ -193,14 +179,14 @@ idnode_unlink(idnode_t *in)
   RB_REMOVE(&idnodes, in, in_link);
   RB_REMOVE(in->in_domain, in, in_domain_link);
   tvhtrace("idnode", "unlink node %s", idnode_uuid_as_str(in));
-  idnode_notify_simple(in);
+  idnode_notify(in, "delete");
 }
 
 /**
  *
  */
 static void
-idnode_handler(size_t off, idnode_t *in)
+idnode_handler(size_t off, idnode_t *in, const char *action)
 {
   void (**fcn)(idnode_t *);
   lock_assert(&global_lock);
@@ -208,6 +194,8 @@ idnode_handler(size_t off, idnode_t *in)
   while (idc) {
     fcn = (void *)idc + off;
     if (*fcn) {
+      if (action)
+        idnode_notify(in, action);
       (*fcn)(in);
       break;
     }
@@ -218,19 +206,19 @@ idnode_handler(size_t off, idnode_t *in)
 void
 idnode_delete(idnode_t *in)
 {
-  return idnode_handler(offsetof(idclass_t, ic_delete), in);
+  idnode_handler(offsetof(idclass_t, ic_delete), in, NULL);
 }
 
 void
 idnode_moveup(idnode_t *in)
 {
-  return idnode_handler(offsetof(idclass_t, ic_moveup), in);
+  return idnode_handler(offsetof(idclass_t, ic_moveup), in, "moveup");
 }
 
 void
 idnode_movedown(idnode_t *in)
 {
-  return idnode_handler(offsetof(idclass_t, ic_movedown), in);
+  return idnode_handler(offsetof(idclass_t, ic_movedown), in, "movedown");
 }
 
 /* **************************************************************************
@@ -1011,7 +999,7 @@ idnode_set_find_index
   return -1;
 }
 
-void
+int
 idnode_set_remove
   ( idnode_set_t *is, idnode_t *in )
 {
@@ -1020,7 +1008,9 @@ idnode_set_remove
     memmove(&is->is_array[i], &is->is_array[i+1],
             (is->is_count - i - 1) * sizeof(idnode_t *));
     is->is_count--;
+    return 1;
   }
+  return 0;
 }
 
 void
@@ -1092,7 +1082,7 @@ idnode_write0 ( idnode_t *self, htsmsg_t *c, int optmask, int dosave )
   if (save && dosave)
     idnode_savefn(self);
   if (dosave)
-    idnode_notify_simple(self);
+    idnode_notify_changed(self);
   // Note: always output event if "dosave", reason is that UI updates on
   //       these, but there are some subtle cases where it will expect
   //       an update and not get one. This include fields being set for
@@ -1104,7 +1094,7 @@ idnode_write0 ( idnode_t *self, htsmsg_t *c, int optmask, int dosave )
 void
 idnode_changed( idnode_t *self )
 {
-  idnode_notify_simple(self);
+  idnode_notify_changed(self);
   idnode_savefn(self);
 }
 
@@ -1334,70 +1324,28 @@ idnode_serialize0(idnode_t *self, htsmsg_t *list, int optmask)
  * *************************************************************************/
 
 /**
- * Delayed notification
- */
-static void
-idnode_notify_delayed ( idnode_t *in, const char *uuid, const char *event )
-{
-  pthread_mutex_lock(&idnode_mutex);
-  if (!idnode_queue)
-    idnode_queue = htsmsg_create_map();
-  htsmsg_set_str(idnode_queue, uuid, event);
-  pthread_cond_signal(&idnode_cond);
-  pthread_mutex_unlock(&idnode_mutex);
-}
-
-/**
- * Update internal event pipes
- */
-static void
-idnode_notify_event ( idnode_t *in )
-{
-  const idclass_t *ic = in->in_class;
-  const char *uuid = idnode_uuid_as_str(in);
-  while (ic) {
-    if (ic->ic_event)
-      idnode_notify_delayed(in, uuid, ic->ic_event);
-    ic = ic->ic_super;
-  }
-}
-
-/**
- * Notify on a given channel
+ * Notify about a change
  */
 void
-idnode_notify
-  (idnode_t *in, int event)
+idnode_notify ( idnode_t *in, const char *action )
 {
+  const idclass_t *ic = in->in_class;
   const char *uuid = idnode_uuid_as_str(in);
 
   if (!tvheadend_running)
     return;
 
-  /* Immediate */
-  if (!event) {
-
-    const idclass_t *ic = in->in_class;
-
-    while (ic) {
-      if (ic->ic_event) {
-        htsmsg_t *m = htsmsg_create_map();
-        htsmsg_add_str(m, "uuid", uuid);
-        notify_by_msg(ic->ic_event, m);
-      }
-      ic = ic->ic_super;
-    }
-  
-  /* Rate-limited */
-  } else {
-    idnode_notify_event(in);
+  while (ic) {
+    if (ic->ic_event)
+      notify_delayed(uuid, ic->ic_event, action);
+    ic = ic->ic_super;
   }
 }
 
 void
-idnode_notify_simple (void *in)
+idnode_notify_changed (void *in)
 {
-  idnode_notify(in, 1);
+  idnode_notify(in, "change");
 }
 
 void
@@ -1407,57 +1355,7 @@ idnode_notify_title_changed (void *in)
   htsmsg_add_str(m, "uuid", idnode_uuid_as_str(in));
   htsmsg_add_str(m, "text", idnode_get_title(in));
   notify_by_msg("title", m);
-  idnode_notify_event(in);
-}
-
-/*
- * Thread for handling notifications
- */
-void*
-idnode_thread ( void *p )
-{
-  idnode_t *node;
-  htsmsg_t *m, *q = NULL;
-  htsmsg_field_t *f;
-  const char *event;
-
-  pthread_mutex_lock(&idnode_mutex);
-
-  while (tvheadend_running) {
-
-    /* Get queue */
-    if (!idnode_queue) {
-      pthread_cond_wait(&idnode_cond, &idnode_mutex);
-      continue;
-    }
-    q            = idnode_queue;
-    idnode_queue = NULL;
-    pthread_mutex_unlock(&idnode_mutex);
-
-    /* Process */
-    pthread_mutex_lock(&global_lock);
-
-    HTSMSG_FOREACH(f, q) {
-      node  = idnode_find(f->hmf_name, NULL, NULL);
-      event = htsmsg_field_get_str(f);
-      m     = htsmsg_create_map();
-      htsmsg_add_str(m, "uuid", f->hmf_name);
-      if (!node)
-        htsmsg_add_u32(m, "removed", 1);
-      notify_by_msg(event, m);
-    }
-    
-    /* Finished */
-    pthread_mutex_unlock(&global_lock);
-    htsmsg_destroy(q);
-
-    /* Wait */
-    usleep(500000);
-    pthread_mutex_lock(&idnode_mutex);
-  }
-  pthread_mutex_unlock(&idnode_mutex);
-  
-  return NULL;
+  idnode_notify_changed(in);
 }
 
 /******************************************************************************
